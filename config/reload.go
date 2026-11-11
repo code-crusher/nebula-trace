@@ -13,9 +13,10 @@ type ReloadResult struct {
 	Err error
 	// Failed is true when a callback could not apply part of the new config
 	Failed bool
-	// RestartRequired is true once any reload has needed a restart, and stays true until the process restarts
+	// RestartRequired is true when a restart is still needed to fully apply the running config. A reload that
+	// reverts the keys that needed one clears it
 	RestartRequired bool
-	// RestartKeys are the keys this reload changed that only apply on a restart
+	// RestartKeys are the keys that differ from what nebula is running and only apply on a restart
 	RestartKeys []string
 }
 
@@ -95,4 +96,17 @@ func (r *Reload) RestartRequiredIfChanged(keys ...string) {
 			r.restart = true
 		}
 	}
+}
+
+// mergeKeys returns the union of a and b, each in order, without duplicates.
+func mergeKeys(a, b []string) []string {
+	merged := make([]string, 0, len(a)+len(b))
+	for _, keys := range [2][]string{a, b} {
+		for _, k := range keys {
+			if !slices.Contains(merged, k) {
+				merged = append(merged, k)
+			}
+		}
+	}
+	return merged
 }
