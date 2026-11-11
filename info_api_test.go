@@ -1,11 +1,14 @@
 package nebula
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/slackhq/nebula/localapi"
+	"github.com/slackhq/nebula/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -124,4 +127,39 @@ func TestInfoHandlerAgreesWithTheCommand(t *testing.T) {
 	_, body = infoGet(t, infoHandler(f), "/v1/identity")
 	fromCommand = mustJSON(t, identity(t, f).Payload())
 	assert.JSONEq(t, string(fromCommand), body)
+}
+
+// TestInfoHandlerOverTCP is the issue's remote half end to end: the daemon's own handler,
+// served by localapi.InfoServer on a TCP address, answers a peer the way the local socket
+// does, and holds the same read-only rules. The address is the whole of the access
+// control; the Nebula firewall's inbound rules decide who may reach it, so this is what a
+// curl from another host on the overlay sees.
+func TestInfoHandlerOverTCP(t *testing.T) {
+	f, _ := identityFixture(t)
+
+	srv := localapi.NewInfoServer(test.NewLogger(), infoHandler(f))
+	require.NoError(t, srv.RebindTCP(context.Background(), "127.0.0.1:0"))
+	t.Cleanup(srv.Stop)
+
+	base := "http://" + srv.Addr()
+	res, err := http.Get(base + "/v1/identity/10.0.0.2")
+	require.NoError(t, err)
+	defer res.Body.Close()
+	require.Equal(t, http.StatusOK, res.StatusCode)
+	require.Equal(t, "application/json", res.Header.Get("Content-Type"))
+
+	var peer hostIdentity
+	require.NoError(t, json.NewDecoder(res.Body).Decode(&peer))
+	assert.Equal(t, "peer", peer.Name)
+	assert.Equal(t, []string{"web", "db"}, peer.Groups)
+
+	// The read-only rule holds on the address as on the socket: a program cannot use it
+	// to act, only to ask.
+	req, err := http.NewRequest(http.MethodPost, base+"/v1/identity", nil)
+	require.NoError(t, err)
+	res, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer res.Body.Close()
+	assert.Equal(t, http.StatusMethodNotAllowed, res.StatusCode)
+	assert.Equal(t, http.MethodGet, res.Header.Get("Allow"))
 }

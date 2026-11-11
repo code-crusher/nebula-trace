@@ -368,7 +368,7 @@ func TestListenRefusesADirectoryOwnedBySomebodyElse(t *testing.T) {
 	asUID(t, me)
 	ln, err := listen(filepath.Join(dir, "s.sock"), OwnerOnly())
 	require.NoError(t, err, "the same directory, seen as our own, serves")
-	release(ln, filepath.Join(dir, "s.sock"), socketID{})
+	release(socketTransport{}, ln, filepath.Join(dir, "s.sock"), socketID{})
 }
 
 // TestListenThroughASymlinkedDirectory: a link where the directory should be is judged
@@ -390,7 +390,7 @@ func TestListenThroughASymlinkedDirectory(t *testing.T) {
 
 	ln, err := listen(path, OwnerOnly())
 	require.NoError(t, err, "our link to our directory")
-	release(ln, path, socketID{})
+	release(socketTransport{}, ln, path, socketID{})
 	assert.NoFileExists(t, filepath.Join(real, "s.sock"))
 
 	asUID(t, me+1)

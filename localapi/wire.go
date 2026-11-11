@@ -55,7 +55,7 @@ func WireControl(ctx context.Context, l *slog.Logger, c *config.C, reg *commands
 
 // WireInfo brings up the info API when the config asks for one, serving h, the daemon's
 // handler for it (Control.InfoHandler), and keeps it following the config across
-// reloads: enabling it, disabling it, moving its socket and changing its mode.
+// reloads: enabling it, disabling it, moving its socket or address, and changing its mode.
 func WireInfo(ctx context.Context, l *slog.Logger, c *config.C, h http.Handler) *InfoServer {
 	return wireInfo(ctx, l.With("subsystem", "localapi"), c, h)
 }
@@ -77,7 +77,7 @@ func sharedSocketPath(c *config.C) (string, bool) {
 	}
 
 	info, err := infoConfigFrom(c)
-	if err != nil || !info.Enabled || !samePath(info.Path, ctl) {
+	if err != nil || !info.Enabled || info.tcp() || !samePath(info.Path, ctl) {
 		return "", false
 	}
 
@@ -168,10 +168,10 @@ func warnUnusable(l *slog.Logger, what, current string, err error) {
 }
 
 // reportRebind logs what a Rebind did beyond the listening line the bind itself writes:
-// nothing for an endpoint left where it was, a move with both paths, and a failure with
-// what the operator is left with. old is the path served before the call, "" for none,
-// want the one asked for, and now the path served after it, which after a failed move
-// is still old.
+// nothing for an endpoint left where it was, a move with both targets, and a failure with
+// what the operator is left with. old is the target served before the call, "" for none,
+// want the one asked for, and now the target served after it, which after a failed move
+// is still old. A target is a socket path or a host:port address.
 //
 // Nearly every failure is the operator's environment, a missing runtime directory or a
 // bad path, and a warning; a name held by another process is an error, since nothing
@@ -184,6 +184,10 @@ func reportRebind(l *slog.Logger, what, old, want string, err error, now string)
 
 	switch {
 	case err == nil:
+		// A target is a socket path or a host:port, and samePath, which is the platform's
+		// spelling of "one path", is a harmless comparison for an address too: two
+		// addresses arrive normalised from parseListenAddr, and an address and a socket
+		// path are never equal.
 		if old != "" && !samePath(old, want) {
 			l.Info("Moved the "+what, "from", old, "to", want)
 		}
@@ -194,8 +198,18 @@ func reportRebind(l *slog.Logger, what, old, want string, err error, now string)
 	}
 }
 
+// currentTarget is where the endpoint is served now, for a log line: its socket path, or
+// its address when it is served over TCP. "" when it is stopped.
+func currentTarget(s *InfoServer) string {
+	if p := s.Path(); p != "" {
+		return p
+	}
+	return s.Addr()
+}
+
 // wireInfo brings up the info API when the config asks for one and follows the config
-// across reloads: enabling it, disabling it, moving its socket and changing its mode.
+// across reloads: enabling it, disabling it, moving its socket or address, and changing
+// its mode.
 //
 // Every reload is reconciled, as the control socket's is; see controlReconciler. A
 // section that does not parse keeps whatever is running: the operator is told, and the
@@ -206,12 +220,12 @@ func wireInfo(ctx context.Context, l *slog.Logger, c *config.C, h http.Handler) 
 	reconcile := func(c *config.C) {
 		cfg, err := infoConfigFrom(c)
 		if err != nil {
-			warnUnusable(l, "local info API", srv.Path(), err)
+			warnUnusable(l, "local info API", currentTarget(srv), err)
 			return
 		}
 
 		if !cfg.Enabled {
-			if srv.Path() != "" {
+			if srv.bound() {
 				srv.Stop()
 				l.Info("Stopped the local info API, it is disabled in the reloaded config")
 			}
@@ -222,18 +236,28 @@ func wireInfo(ctx context.Context, l *slog.Logger, c *config.C, h http.Handler) 
 		// here, from the configured paths, because listen's own answer, that the socket is
 		// in use by another nebula, would send the operator looking for a second process.
 		if p, shared := sharedSocketPath(c); shared {
-			if cur := srv.Path(); cur != "" {
+			if srv.bound() {
 				l.Warn("Ignoring the local info API's new socket path, it is also the control socket's; keeping the current endpoint",
-					"path", p, "current", cur, "fix", "set "+InfoSocketKey+" to another path")
+					"path", p, "current", currentTarget(srv), "fix", "set "+InfoSocketKey+" to another path")
 			} else {
 				l.Warn("Local info API is not available, its socket path is also the control socket's", "path", p, "fix", "set "+InfoSocketKey+" to another path")
 			}
 			return
 		}
 
-		old := srv.Path()
-		err = srv.Rebind(ctx, cfg.Path, cfg.Access)
-		reportRebind(l, "local info API", old, cfg.Path, err, srv.Path())
+		// The configured targets are what decide whether this is a move, not the bound
+		// address: a port the kernel chose is not what the config asked for, so comparing
+		// it would call every reload of the same ":0" config a move. A change of transport
+		// is always a move, whatever the two targets read like.
+		old := srv.target()
+		target := cfg.Path
+		if cfg.tcp() {
+			target = cfg.Listen
+			err = srv.RebindTCP(ctx, cfg.Listen)
+		} else {
+			err = srv.Rebind(ctx, cfg.Path, cfg.Access)
+		}
+		reportRebind(l, "local info API", old, target, err, currentTarget(srv))
 	}
 
 	// Registered before the first attempt, as the control socket's is; see wireControl.

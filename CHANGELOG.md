@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The info API can be served over TCP with `local_api.info.listen: <ip>:<port>`, as well as on the local socket
+  `local_api.info.socket` already named. This is the remote half of the API the local socket began: an address on the
+  node's nebula address is reachable by peers, and the Nebula firewall's inbound rules decide who may connect, so a
+  rule limited by host, group or cidr is the access control. Only the address given is bound; a wildcard or a hostname
+  is refused, since either could serve more interfaces than the operator sees in the config. `socket`, `group` and
+  `socket_mode` do not apply to an address and are refused alongside `listen`. A reload can move the API between a
+  socket and an address. (#1398)
+
 ## [1.12.0] - 2026-10-29
 
 This release introduces udp/tun offloading support that can be enabled for greater performance. This will be enabled by default in a future release. See the `listen.udp_offloads` and `tun.use_offloads` example config settings for more details.

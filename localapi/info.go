@@ -20,9 +20,10 @@ import (
 	"golang.org/x/net/netutil"
 )
 
-// The info API's config keys. It is off until InfoEnabledKey is true and InfoSocketKey
-// names a socket; nothing is derived, because the programs that will dial it have to be
-// told where it is anyway.
+// The info API's config keys. It is off until InfoEnabledKey is true and one of
+// InfoSocketKey and InfoListenKey names where to serve it: a local socket, or a TCP
+// address reached over the Nebula interface. Nothing is derived, because the programs
+// that will dial it have to be told where it is anyway.
 const (
 	InfoEnabledKey = "local_api.info.enabled"
 	InfoSocketKey  = "local_api.info.socket"
@@ -55,13 +56,14 @@ var (
 )
 
 // InfoServer serves the info API over HTTP, on a socket an operator may open to other
-// users on the host.
+// users on the host, or on a TCP address reached over the overlay and admitted by the
+// Nebula firewall.
 //
 // It is the second local API, and the opposite of the control socket in who it is for.
 // The control socket is for the user who runs nebula, serves nearly everything and needs
-// no configuration. This one is for every other program on the machine, a web server
-// that wants to know who is on the other end of a connection arriving over the overlay,
-// say, and it is off until an operator names a socket and a mode for it. What it serves
+// no configuration. This one is for every other program, a web server that wants to know
+// who is on the other end of a connection arriving over the overlay, say, and it is off
+// until an operator names a socket and a mode, or a listen address, for it. What it serves
 // is the handler nebula builds for it, Control.InfoHandler: the identity a certificate
 // asserts and nothing operational, so opening it to a group of services, or to everyone
 // on the host, gives away nothing the overlay did not already tell them. This server is
@@ -91,7 +93,29 @@ func (s *InfoServer) Rebind(ctx context.Context, path string, acc Access) error 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.rebindLocked(ctx, path, acc, func(ln net.Listener) io.Closer {
+	return s.rebindSocket(ctx, socketTransport{}, path, acc)
+}
+
+// RebindTCP brings the server up on a TCP address, moves it there, or, when it is
+// already there, does nothing. It is Rebind for the remote half of the endpoint: the
+// address is the whole of the access control, so there is no mode or group, and a
+// reload that changes the address moves the listener.
+//
+// The address must be one an operator chose; see parseListenAddr for why a wildcard is
+// refused. What may connect to it is the Nebula firewall's business: the daemon's inbound
+// rules decide, by host, group or port, who reaches the address at all.
+func (s *InfoServer) RebindTCP(ctx context.Context, addr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.rebindSocket(ctx, tcpTransport{}, addr, Access{})
+}
+
+// rebindSocket is the one bind path, shared by the socket and TCP forms so that the
+// lifecycle, the shutdown guard and the log lines are the same either way. The caller
+// holds s.mu.
+func (s *InfoServer) rebindSocket(ctx context.Context, t transport, target string, acc Access) error {
+	return s.rebindLocked(ctx, t, target, acc, func(ln net.Listener) io.Closer {
 		srv := &http.Server{
 			Handler:           s.handler(),
 			ReadHeaderTimeout: infoReadHeaderTimeout,
@@ -102,8 +126,14 @@ func (s *InfoServer) Rebind(ctx context.Context, path string, acc Access) error 
 			ErrorLog:          slog.NewLogLogger(s.l.Handler(), slog.LevelDebug),
 		}
 
-		s.l.Info("Local info API listening", "path", path, "access", acc.String())
-		warnUnprotectedName(s.l, path)
+		if isTCPTransport(t) {
+			// A TCP endpoint's access control is the address plus the firewall, not a mode
+			// or a group, and there is no pipe name to warn about.
+			s.l.Info("Local info API listening", "addr", target, "access", "the firewall's inbound rules")
+		} else {
+			s.l.Info("Local info API listening", "path", target, "access", acc.String())
+			warnUnprotectedName(s.l, target)
+		}
 		go s.serve(srv, ln)
 
 		// Closing the server closes the listener Serve was handed, and a Serve that has
@@ -215,9 +245,16 @@ func WriteJSONError(w http.ResponseWriter, status int, msg string) {
 // infoConfig is the info API section of a config, read and checked.
 type infoConfig struct {
 	Enabled bool
-	Path    string
-	Access  Access
+	// Path is the socket path, when the API is served on a local socket.
+	Path string
+	// Listen is the host:port address, when the API is served over TCP. Exactly one of
+	// Path and Listen is set on an enabled section.
+	Listen string
+	Access Access
 }
+
+// tcp reports whether the API is served over TCP rather than on a local socket.
+func (cfg infoConfig) tcp() bool { return cfg.Listen != "" }
 
 // infoConfigFrom reads the info API section. A disabled section needs nothing else to be
 // right; an enabled one needs a socket path, a group that exists if it names one, and
@@ -231,9 +268,32 @@ func infoConfigFrom(c *config.C) (infoConfig, error) {
 	}
 
 	p := c.GetString(InfoSocketKey, "")
-	if p == "" {
-		return cfg, fmt.Errorf("%s is true but %s is not set; the info API needs a socket path", InfoEnabledKey, InfoSocketKey)
+	listen := c.GetString(InfoListenKey, "")
+	switch {
+	case p != "" && listen != "":
+		return cfg, fmt.Errorf("%s and %s are both set; the info API is served on one or the other, not both", InfoSocketKey, InfoListenKey)
+	case p == "" && listen == "":
+		return cfg, fmt.Errorf("%s is true but neither %s nor %s is set; the info API needs a socket path or a listen address", InfoEnabledKey, InfoSocketKey, InfoListenKey)
 	}
+
+	if listen != "" {
+		// A TCP endpoint has no node, so the socket's mode, group and path mean nothing
+		// to it. Refused rather than ignored, so an operator who meant to restrict the
+		// address with them learns that the address is the whole of the access control
+		// before the API is served wider than they think.
+		for _, key := range []string{InfoModeKey, InfoGroupKey} {
+			if c.Get(key) != nil {
+				return cfg, fmt.Errorf("%s has no effect with %s; a TCP address has no mode or group, name the node's nebula address and let the firewall decide who may connect", key, InfoListenKey)
+			}
+		}
+		addr, err := parseListenAddr(listen)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Listen = addr
+		return cfg, nil
+	}
+
 	if err := checkSocketPath(InfoSocketKey, p); err != nil {
 		return cfg, err
 	}

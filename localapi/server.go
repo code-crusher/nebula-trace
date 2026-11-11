@@ -82,7 +82,7 @@ func (s *Server) Rebind(ctx context.Context, path string, acc Access) error {
 	// arriving before a group's mode is set is refused by the kernel, and with a group
 	// being taken away the peer check applies a moment before the mode tightens.
 	s.trustSocket.Store(acc.shared())
-	err := s.rebindLocked(ctx, path, acc, func(ln net.Listener) io.Closer {
+	err := s.rebindLocked(ctx, socketTransport{}, path, acc, func(ln net.Listener) io.Closer {
 		s.l.Info("Local control socket listening", "path", path, "access", acc.String())
 		// Closing the listener, when it is given up, ends the accept loop on the
 		// closed-listener error; in flight commands keep their connections, which stay

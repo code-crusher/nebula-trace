@@ -278,9 +278,22 @@ punchy:
   #
   #info:
     #enabled: false
+    # The info API is served on exactly one of a local socket and a TCP address. A socket
+    # is reachable by whoever can reach the file, a TCP address on this node's nebula
+    # address is reachable by peers the firewall's inbound rules admit. Set one key or the
+    # other, not both. Reloadable, including moving between the two.
+    #
     # The absolute path to listen on, or a full pipe name on Windows. Name a pipe under
     # \\.\pipe\ProtectedPrefix\Administrators\.
     #socket: /var/run/nebula/info.sock
+    # A host:port address to listen on instead of a socket, e.g. the node's nebula address
+    # and a port: "10.42.0.1:8080". Only the address given is bound: a wildcard
+    # (0.0.0.0, ::, or a bare ":8080") is refused, since it would serve every interface
+    # the host has, where the Nebula firewall does not apply. The host must be an IP
+    # literal, not a name, which would be resolved at bind time. What may connect is the
+    # firewall's business: add an inbound rule for the port, limited by host, group or
+    # cidr as you like. socket, group and socket_mode do not apply to an address.
+    #listen: 10.42.0.1:8080
     # A group (or account/group/SID on Windows) that should be allowed to access the
     # socket. On Windows a group cannot be changed while the socket is served: a group
     # added takes effect after a restart, and one removed or changed stops the socket

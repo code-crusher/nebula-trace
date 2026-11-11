@@ -125,7 +125,7 @@ func listen(path string, acc Access) (net.Listener, error) {
 	// The umask only promises no looser than 0600; this pins the mode and the group
 	// exactly, and is the one place a failure to secure the socket is reported.
 	if err := applyAccess(path, acc); err != nil {
-		release(ln, path, id)
+		release(socketTransport{}, ln, path, id)
 		return nil, fmt.Errorf("could not secure %s: %w", path, err)
 	}
 
