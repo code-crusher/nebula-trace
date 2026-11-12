@@ -65,7 +65,7 @@ type Reload struct {
 	c       *C
 	failed  bool
 	restart bool
-	// Changed keys that only apply on a restart, from every callback
+	// The keys that only apply on a restart and changed, from every callback
 	keys []string
 }
 
@@ -84,29 +84,18 @@ func (r *Reload) RestartRequired() {
 	}
 }
 
-// RestartRequiredIfChanged marks the reload as needing a restart if any of keys changed, and adds them to RestartKeys.
-// Use it for keys that are only read at startup. Safe to call on a nil Reload.
+// RestartRequiredIfChanged marks the reload as needing a restart if any of keys no longer match what nebula is
+// running, and adds them to RestartKeys. Use it for keys that are only read at startup, which run their startup
+// value for the life of the process. Safe to call on a nil Reload.
 func (r *Reload) RestartRequiredIfChanged(keys ...string) {
 	if r == nil {
 		return
 	}
 	for _, k := range keys {
-		if r.c.HasChanged(k) && !slices.Contains(r.keys, k) {
+		if r.c.HasChangedSinceStartup(k) && !slices.Contains(r.keys, k) {
 			r.keys = append(r.keys, k)
 			r.restart = true
 		}
 	}
 }
 
-// mergeKeys returns the union of a and b, each in order, without duplicates.
-func mergeKeys(a, b []string) []string {
-	merged := make([]string, 0, len(a)+len(b))
-	for _, keys := range [2][]string{a, b} {
-		for _, k := range keys {
-			if !slices.Contains(merged, k) {
-				merged = append(merged, k)
-			}
-		}
-	}
-	return merged
-}

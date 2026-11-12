@@ -116,20 +116,46 @@ func TestConfig_HasChanged(t *testing.T) {
 	c := NewC(l)
 	c.Settings["test"] = "hi"
 	assert.False(t, c.HasChanged(""))
+	assert.False(t, c.HasChangedSinceStartup("test"))
 
 	// Test key change
 	c = NewC(l)
 	c.Settings["test"] = "hi"
-	c.oldSettings = map[string]any{"test": "no"}
+	c.runSettings = map[string]any{"test": "no"}
+	c.startupSettings = map[string]any{"test": "no"}
 	assert.True(t, c.HasChanged("test"))
 	assert.True(t, c.HasChanged(""))
+	assert.True(t, c.HasChangedSinceStartup("test"))
 
 	// No key change
 	c = NewC(l)
 	c.Settings["test"] = "hi"
-	c.oldSettings = map[string]any{"test": "hi"}
+	c.runSettings = map[string]any{"test": "hi"}
+	c.startupSettings = map[string]any{"test": "hi"}
 	assert.False(t, c.HasChanged("test"))
 	assert.False(t, c.HasChanged(""))
+	assert.False(t, c.HasChangedSinceStartup("test"))
+}
+
+// HasChanged reads scalar keys the way the getters do, so a number quoted in one config and not the other is not
+// a change
+func TestConfig_HasChangedReadsScalarsLikeTheGettersDo(t *testing.T) {
+	changed := func(from, to string) bool {
+		c := NewC(test.NewLogger())
+		require.NoError(t, c.LoadString(from))
+		// The callback window is what a subsystem sees, so decide inside one
+		var got bool
+		c.RegisterReloadCallback(func(c *C, r *Reload) {
+			got = c.HasChanged("listen.port")
+		})
+		require.NoError(t, c.ReloadConfigString(to).Err)
+		return got
+	}
+
+	assert.False(t, changed("listen:\n  port: 4242\n", "listen:\n  port: \"4242\"\n"), "a quoted int")
+	assert.False(t, changed("listen:\n  port: 4242\n", "listen:\n  port: 0x1092\n"), "hex")
+	assert.True(t, changed("listen:\n  port: 4242\n", "listen:\n  port: 4243\n"), "a different port")
+	assert.True(t, changed("listen:\n  port: 4242\n", "other: 1\n"), "omitted is a change while it is new")
 }
 
 func TestConfig_ReloadConfig(t *testing.T) {
@@ -153,9 +179,12 @@ func TestConfig_ReloadConfig(t *testing.T) {
 	})
 
 	c.ReloadConfig()
-	assert.True(t, c.HasChanged("outer.inner"))
-	assert.True(t, c.HasChanged("outer"))
-	assert.True(t, c.HasChanged(""))
+	assert.False(t, c.HasChanged("outer.inner"), "a reload with no failures applied what it loaded")
+	assert.False(t, c.HasChanged("outer"))
+	assert.False(t, c.HasChanged(""))
+	assert.True(t, c.HasChangedSinceStartup("outer.inner"))
+	assert.True(t, c.HasChangedSinceStartup("outer"))
+	assert.True(t, c.HasChangedSinceStartup(""))
 
 	// Make sure we call the callbacks
 	select {

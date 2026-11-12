@@ -35,7 +35,10 @@ func TestReloadConfigString(t *testing.T) {
 	assert.Equal(t, 3, c.GetInt("a", 0))
 }
 
-func TestReloadRestartRequiredLatches(t *testing.T) {
+// A restart key is decided against what nebula is running, not the last config: the one a reload brought that
+// needs a restart stays reported, reverting it drops it again, and a config that does not load doesn't change
+// the verdict
+func TestReloadRestartRequiredIsDiffedAgainstTheRunningConfig(t *testing.T) {
 	c := NewC(test.NewLogger())
 	require.NoError(t, c.LoadString("a: 1\nb: 1"))
 	c.RegisterReloadCallback(func(c *C, r *Reload) { r.RestartRequiredIfChanged("a", "b") })
@@ -44,14 +47,19 @@ func TestReloadRestartRequiredLatches(t *testing.T) {
 	assert.Equal(t, ReloadResult{}, c.ReloadConfigString("a: 1\nb: 1\nc: 1"))
 	assert.Equal(t, ReloadResult{RestartRequired: true, RestartKeys: []string{"a"}}, c.ReloadConfigString("a: 2\nb: 1\nc: 1"))
 
-	// The restart sticks through a reload with no changes, reverting the key and a config that fails to load. Only the
-	// reload that changed the key lists it
-	assert.Equal(t, ReloadResult{RestartRequired: true}, c.ReloadConfigString("a: 2\nb: 1\nc: 1"))
-	assert.Equal(t, ReloadResult{RestartRequired: true, RestartKeys: []string{"a"}}, c.ReloadConfigString("a: 1\nb: 1\nc: 1"))
+	// The restart is still needed, still naming the key
+	assert.Equal(t, ReloadResult{RestartRequired: true, RestartKeys: []string{"a"}}, c.ReloadConfigString("a: 2\nb: 1\nc: 1"))
+
+	// Reverting the key needs nothing, a restart would apply it to no effect
+	assert.Equal(t, ReloadResult{}, c.ReloadConfigString("a: 1\nb: 1\nc: 1"))
+
+	// And bringing it back needs one again
+	assert.Equal(t, ReloadResult{RestartRequired: true, RestartKeys: []string{"a"}}, c.ReloadConfigString("a: 2\nb: 1\nc: 1"))
 
 	res := c.ReloadConfigString("a: [")
 	require.Error(t, res.Err)
-	assert.True(t, res.RestartRequired)
+	assert.True(t, res.RestartRequired, "a config that did not load leaves the pending restart standing")
+	assert.Equal(t, []string{"a"}, res.RestartKeys)
 }
 
 // A key reported by more than one callback is listed once
@@ -60,7 +68,6 @@ func TestReloadRestartKeysDeduped(t *testing.T) {
 	require.NoError(t, c.LoadString("a: 1\nb: 1"))
 	c.RegisterReloadCallback(func(c *C, r *Reload) { r.RestartRequiredIfChanged("a") })
 	c.RegisterReloadCallback(func(c *C, r *Reload) { r.RestartRequiredIfChanged("a", "b") })
-
 	assert.Equal(t, []string{"a", "b"}, c.ReloadConfigString("a: 2\nb: 2").RestartKeys)
 }
 
@@ -105,4 +112,54 @@ func TestReloadNilIsSafe(t *testing.T) {
 	r.Failed()
 	r.RestartRequired()
 	r.RestartRequiredIfChanged("a")
+}
+
+// A reload that fails partway is not what nebula runs, so repeating it unchanged still reports every key it
+// changed rather than saying nothing changed since the last load
+func TestReloadFailedThenRepeatedStillReportsItsChanges(t *testing.T) {
+	c := NewC(test.NewLogger())
+	require.NoError(t, c.LoadString("a: 1"))
+	var applied []string
+	c.RegisterReloadCallback(func(c *C, r *Reload) {
+		if c.HasChanged("a") {
+			applied = append(applied, "a")
+			r.Failed()
+		}
+	})
+
+	assert.Equal(t, ReloadResult{Failed: true}, c.ReloadConfigString("a: 2"))
+	assert.Equal(t, ReloadResult{Failed: true}, c.ReloadConfigString("a: 2"), "the same reload is retried in full")
+	assert.Equal(t, []string{"a", "a"}, applied)
+}
+
+// A key that a reload omits reads as a change to nil, whatever the getters would default it to. Subsystems that
+// need the default handled right compare the getter's value, not the raw key
+func TestReloadOmittedKeyReadsAsNil(t *testing.T) {
+	c := NewC(test.NewLogger())
+	require.NoError(t, c.LoadString("listen:\n  port: 4242"))
+	c.RegisterReloadCallback(func(c *C, r *Reload) {
+		if c.HasChanged("listen.port") {
+			r.Failed()
+		}
+	})
+
+	assert.Equal(t, ReloadResult{Failed: true}, c.ReloadConfigString("other: 1"))
+	assert.Equal(t, ReloadResult{Failed: true}, c.ReloadConfigString("other: 1"), "nil still differs from what is running")
+}
+
+// A restart that names no key, like a cert that changes our networks, is re-decided by every reload that runs its
+// callbacks and kept by one whose config does not load
+func TestReloadKeylessRestartSurvivesAConfigThatDoesNotLoad(t *testing.T) {
+	c := NewC(test.NewLogger())
+	require.NoError(t, c.LoadString("a: 1"))
+	c.RegisterReloadCallback(func(c *C, r *Reload) { r.RestartRequired() })
+
+	assert.Equal(t, ReloadResult{RestartRequired: true}, c.ReloadConfigString("a: 1"))
+
+	res := c.ReloadConfigString("a: [")
+	require.Error(t, res.Err)
+	assert.True(t, res.RestartRequired, "the pending restart stands")
+	assert.Empty(t, res.RestartKeys, "and still names no key")
+
+	assert.Equal(t, ReloadResult{RestartRequired: true}, c.ReloadConfigString("a: 1"), "the next good reload re-decides")
 }

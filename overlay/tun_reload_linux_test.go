@@ -28,8 +28,12 @@ func TestReloadMTUOnlyKeepsRoutes(t *testing.T) {
 	}
 	require.NoError(t, tn.reload(c, true, nil))
 
+	// The tun reload has to run inside the reload's callback, HasChanged only reports a change while
+	// one is being applied
+	c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
+		require.NoError(t, tn.reload(c, false, r))
+	})
 	require.NoError(t, c.ReloadConfigString("tun:\n  mtu: 1400\n"+routes).Err)
-	_ = tn.reload(c, false, nil)
 
 	got := *tn.Routes.Load()
 	require.Len(t, got, 1)

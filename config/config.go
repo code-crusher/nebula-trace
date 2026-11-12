@@ -22,24 +22,30 @@ import (
 )
 
 type C struct {
-	path        string
-	files       []string
-	Settings    map[string]any
-	oldSettings map[string]any
-	// runSettings is what nebula is running, the settings the last load that
-	// succeeded left behind. A reload decides what changed by comparing
-	// against it, not against oldSettings, so a reload that failed partway
-	// and is repeated still reports what never applied. Guarded by reloadLock
+	path     string
+	files    []string
+	Settings map[string]any
+	// runSettings is the last config that loaded and applied cleanly, what a reload diffs a key against to decide if
+	// it changed. It only advances when nothing failed, so a reload that fails partway is retried in full by the next
+	// one. Guarded by reloadLock
 	runSettings map[string]any
-	callbacks   []func(*C, *Reload)
-	l           *slog.Logger
-	reloadLock  sync.Mutex
+	// startupSettings is the config the process booted with, set the first time a load happens. RestartRequiredIfChanged
+	// diffs against it, because a key that only applies on a restart is running its startup value for the life of
+	// the process. Guarded by reloadLock
+	startupSettings map[string]any
+	callbacks       []func(*C, *Reload)
+	l              *slog.Logger
+	reloadLock     sync.Mutex
 
-	// The keys a reload has found that only apply on a restart, and never
-	// cleared. A later reload re-decides each one against the running
-	// config, so a reverted or still failing key stays listed. Guarded by
+	// The keys that only apply on a restart and differ from what nebula is running, as the last reload that ran its
+	// callbacks found them. A later reload re-decides each one, so a key that is reverted drops out. Guarded by
 	// reloadLock
 	restartKeys []string
+
+	// needsRestart is the last reload's verdict on whether a restart is required, kept so a reload whose config does
+	// not load, and so cannot re-decide, still reports it. It covers the restarts that name no key, like a new cert
+	// that changes our networks. Guarded by reloadLock
+	needsRestart bool
 
 	// callbackLock guards callbacks. Registration is not confined to startup: CatchHUP is
 	// running from inside Main, and anything wired up after Main returns registers while
@@ -109,7 +115,7 @@ func (c *C) reloadCallbacks() []func(*C, *Reload) {
 
 // InitialLoad returns true if this is the first load of the config, and ReloadConfig has not been called yet.
 func (c *C) InitialLoad() bool {
-	return c.runSettings == nil
+	return c.startupSettings == nil
 }
 
 // Render returns keys and their values as yaml, for a subsystem to remember what it applied. Empty means they couldn't
@@ -128,11 +134,21 @@ func (c *C) Render(keys ...string) string {
 }
 
 // HasChanged checks if the underlying structure of the provided key has changed after a config reload. The value of
-// k in both the running and the new settings will be serialized, the result of the string comparison is returned.
-// If k is an empty string the entire config is tested.
+// k in the last config that applied cleanly and the new settings will be serialized, the result of the string
+// comparison is returned. If k is an empty string the entire config is tested.
 // It's important to note that this is very rudimentary and susceptible to configuration ordering issues indicating
 // there is change when there actually wasn't any.
 func (c *C) HasChanged(k string) bool {
+	return c.hasChanged(k, c.runSettings)
+}
+
+// HasChangedSinceStartup is HasChanged against the config the process started with, which is what a key that only
+// applies on a restart keeps running until the process restarts.
+func (c *C) HasChangedSinceStartup(k string) bool {
+	return c.hasChanged(k, c.startupSettings)
+}
+
+func (c *C) hasChanged(k string, from map[string]any) bool {
 	if c.InitialLoad() {
 		return false
 	}
@@ -144,11 +160,23 @@ func (c *C) HasChanged(k string) bool {
 
 	if k == "" {
 		nv = c.Settings
-		ov = c.runSettings
+		ov = from
 		k = "all settings"
 	} else {
 		nv = c.get(k, c.Settings)
-		ov = c.get(k, c.runSettings)
+		ov = c.get(k, from)
+	}
+
+	// A scalar is compared the way the getters read it, as a string. A quoted int in one config and a bare one in
+	// the other is the same value to nebula, and yaml would marshal the two differently
+	if nv == nil || ov == nil {
+		return nv != ov
+	}
+	if _, ok := nv.(map[string]any); !ok {
+		if _, ok := nv.([]any); !ok {
+			nv = fmt.Sprintf("%v", nv)
+			ov = fmt.Sprintf("%v", ov)
+		}
 	}
 
 	newVals, err := yaml.Marshal(nv)
@@ -161,7 +189,7 @@ func (c *C) HasChanged(k string) bool {
 
 	oldVals, err := yaml.Marshal(ov)
 	if err != nil {
-		c.l.Error("Error while marshaling running config",
+		c.l.Error("Error while marshaling old config",
 			"config_path", k,
 			"error", err,
 		)
@@ -170,19 +198,8 @@ func (c *C) HasChanged(k string) bool {
 	return string(newVals) != string(oldVals)
 }
 
-// getChangedKeys returns the subset of keys that HasChanged reports as changed. Ordering follows keys.
-func (c *C) getChangedKeys(keys []string) []string {
-	var changed []string
-	for _, k := range keys {
-		if c.HasChanged(k) {
-			changed = append(changed, k)
-		}
-	}
-	return changed
-}
-
 // CatchHUP will listen for the HUP signal in a go routine and reload all configs found in the
-// original path provided to Load. The old settings are shallow copied for change detection after the reload.
+// original path provided to Load.
 func (c *C) CatchHUP(ctx context.Context) {
 	if c.path == "" {
 		return
@@ -209,61 +226,59 @@ func (c *C) CatchHUP(ctx context.Context) {
 // ReloadConfig reloads the config from the path provided to Load and runs every registered callback. A config that
 // fails to load is logged here, like any other failure, and the result carries the error for the summary.
 func (c *C) ReloadConfig() ReloadResult {
-	c.reloadLock.Lock()
-	defer c.reloadLock.Unlock()
-
-	c.oldSettings = make(map[string]any)
-	maps.Copy(c.oldSettings, c.Settings)
-
-	if err := c.Load(c.path); err != nil {
-		c.l.Error("Error occurred while reloading config", "config_path", c.path, "error", err)
-		return c.reloadResult(nil, err)
-	}
-
-	res := c.runCallbacks()
-	return c.reloadResult(&res, nil)
+	return c.reload(func() error { return c.Load(c.path) }, "config_path", c.path)
 }
 
 // ReloadConfigString is ReloadConfig for a config held in memory rather than on disk.
 func (c *C) ReloadConfigString(raw string) ReloadResult {
+	return c.reload(func() error { return c.LoadString(raw) }, "", nil)
+}
+
+// reload runs load and then the callbacks, and assembles the result. load failing is logged, like any other failure,
+// and the result carries the error for the summary. logKey is only for the log line.
+func (c *C) reload(load func() error, logKey string, logValue any) ReloadResult {
 	c.reloadLock.Lock()
 	defer c.reloadLock.Unlock()
 
-	c.oldSettings = make(map[string]any)
-	maps.Copy(c.oldSettings, c.Settings)
+	// What is running before this reload: the startup config if no reload has applied yet, otherwise what the last
+	// reload that applied cleanly left behind
+	running := c.Settings
 
-	if err := c.LoadString(raw); err != nil {
-		c.l.Error("Error occurred while reloading config", "error", err)
-		return c.reloadResult(nil, err)
+	if err := load(); err != nil {
+		if logKey != "" {
+			c.l.Error("Error occurred while reloading config", logKey, logValue, "error", err)
+		} else {
+			c.l.Error("Error occurred while reloading config", "error", err)
+		}
+		// Nothing was applied, so the verdict the last reload that ran its callbacks reached still stands
+		return ReloadResult{Err: err, RestartRequired: c.needsRestart, RestartKeys: c.restartKeys}
 	}
 
-	res := c.runCallbacks()
-	return c.reloadResult(&res, nil)
-}
-
-// reloadResult assembles the ReloadResult after a reload. res is nil when the new config did not load, in which case
-// err is the reason. When it did load, the running settings follow it: they are what the next reload diffs against,
-// and they are only replaced once the callbacks had their say, so a failure during a later reload keeps diffing
-// against what this one applied.
-func (c *C) reloadResult(res *ReloadResult, err error) ReloadResult {
-	if err != nil {
-		return ReloadResult{Err: err, RestartRequired: len(c.restartKeys) > 0, RestartKeys: c.restartKeys}
+	if c.startupSettings == nil {
+		c.startupSettings = make(map[string]any)
+		maps.Copy(c.startupSettings, running)
+		c.runSettings = make(map[string]any)
+		maps.Copy(c.runSettings, running)
 	}
-	c.runSettings = make(map[string]any)
-	maps.Copy(c.runSettings, c.Settings)
-	return *res
-}
 
-func (c *C) runCallbacks() ReloadResult {
 	r := &Reload{c: c}
 	for _, v := range c.reloadCallbacks() {
 		v(c, r)
 	}
 
-	// The keys that need a restart are remembered, so a reload that reverts one or a reload that changed nothing at
-	// all still reports the ones a restart is still needed for
-	c.restartKeys = mergeKeys(c.restartKeys, r.keys)
-	return ReloadResult{Failed: r.failed, RestartRequired: len(c.restartKeys) > 0 || r.restart, RestartKeys: c.restartKeys}
+	// RestartRequiredIfChanged re-decides every key against what nebula is running, so this is the complete set:
+	// a reload that reverts a key drops it, one that changes nothing lists whatever still differs
+	c.restartKeys = r.keys
+	c.needsRestart = r.restart || len(r.keys) > 0
+
+	// What a reload diffs against only advances when nothing failed, so a reload that fails partway is retried in
+	// full by the next one rather than reporting that nothing changed
+	if !r.failed {
+		c.runSettings = make(map[string]any)
+		maps.Copy(c.runSettings, c.Settings)
+	}
+
+	return ReloadResult{Failed: r.failed, RestartRequired: c.needsRestart, RestartKeys: r.keys}
 }
 
 // GetString will get the string for k or return the default d if not found or invalid
