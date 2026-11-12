@@ -422,6 +422,71 @@ func TestLighthouse_reloadStaticHostMap(t *testing.T) {
 	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("3.3.3.3:4242")}, rl.CopyAddrs([]netip.Prefix{}))
 }
 
+// TestLighthouse_reloadRemoteAllowListRefiltersStaticHostMap verifies that a reload which only
+// changes the remote allow list re-applies it to the cached static_host_map addresses. See issue #1962.
+func TestLighthouse_reloadRemoteAllowListRefiltersStaticHostMap(t *testing.T) {
+	l := test.NewLogger()
+	c := config.NewC(l)
+
+	// reloadAllowList re-renders the full config, changing only the remote allow list, so that
+	// static_host_map is not itself considered changed by the reload.
+	reloadAllowList := func(allow bool) {
+		nc := map[string]any{
+			"lighthouse": map[string]any{
+				"am_lighthouse": true,
+				"remote_allow_list": map[string]any{
+					"1.0.0.0/8": allow,
+				},
+			},
+			"listen": map[string]any{"port": 4242},
+			"static_host_map": map[string]any{
+				"10.128.0.2": []any{"1.1.1.1:4242"},
+			},
+		}
+		rc, err := yaml.Marshal(nc)
+		require.NoError(t, err)
+		require.NoError(t, c.ReloadConfigString(string(rc)).Err)
+	}
+
+	c.Settings["lighthouse"] = map[string]any{
+		"am_lighthouse": true,
+		"remote_allow_list": map[string]any{
+			"1.0.0.0/8": true,
+		},
+	}
+	c.Settings["listen"] = map[string]any{"port": 4242}
+	c.Settings["static_host_map"] = map[string]any{
+		"10.128.0.2": []any{"1.1.1.1:4242"},
+	}
+
+	myVpnNet := netip.MustParsePrefix("10.128.0.1/24")
+	cs := testCertState(myVpnNet)
+
+	lh, err := NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
+	require.NoError(t, err)
+
+	staticHost := netip.MustParseAddr("10.128.0.2")
+	allowed := []netip.AddrPort{netip.MustParseAddrPort("1.1.1.1:4242")}
+
+	rl := lh.Query(staticHost)
+	require.NotNil(t, rl)
+	assert.Equal(t, allowed, rl.CopyAddrs([]netip.Prefix{}))
+
+	// Deny the static address. A reload that only touches the allow list must drop it.
+	reloadAllowList(false)
+
+	rl = lh.Query(staticHost)
+	require.NotNil(t, rl)
+	assert.Empty(t, rl.CopyAddrs([]netip.Prefix{}), "a deny added on reload must remove the static address")
+
+	// Allow it again. The reload must put the static address back without a restart.
+	reloadAllowList(true)
+
+	rl = lh.Query(staticHost)
+	require.NotNil(t, rl)
+	assert.Equal(t, allowed, rl.CopyAddrs([]netip.Prefix{}), "a removed deny must restore the static address")
+}
+
 // sendLHHostRequest delivers a HostQuery to lhh and hands back the writer that
 // captured what it emitted. Pass a nil filter to see every message.
 func sendLHHostRequest(fromAddr netip.AddrPort, myVpnIp, queryVpnIp netip.Addr, lhh *LightHouseHandler, filter *NebulaMeta_MessageType) *testEncWriter {
