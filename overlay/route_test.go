@@ -214,6 +214,34 @@ func Test_parseUnsafeRoutes(t *testing.T) {
 	assert.Nil(t, routes)
 	require.EqualError(t, err, "entry 1.route in tun.unsafe_routes is contained within the configured vpn networks; route: 10.0.0.0/24, network: 10.0.0.0/24")
 
+	// via is our own vpn addr
+	self := netip.MustParsePrefix("10.0.0.1/24")
+	c.Settings["tun"] = map[string]any{"unsafe_routes": []any{map[string]any{"via": "10.0.0.1", "route": "192.168.6.0/24"}}}
+	routes, err = parseUnsafeRoutes(c, []netip.Prefix{self})
+	assert.Nil(t, routes)
+	require.EqualError(t, err, "entry 1.via in tun.unsafe_routes is this host's own address; via: 10.0.0.1")
+
+	// one of the ECMP gateways is our own vpn addr
+	c.Settings["tun"] = map[string]any{"unsafe_routes": []any{map[string]any{"route": "192.168.6.0/24", "via": []any{
+		map[string]any{"gateway": "10.0.0.2"},
+		map[string]any{"gateway": "10.0.0.1"},
+	}}}}
+	routes, err = parseUnsafeRoutes(c, []netip.Prefix{self})
+	assert.Nil(t, routes)
+	require.EqualError(t, err, "entry 1.via in tun.unsafe_routes is this host's own address; via: 10.0.0.1")
+
+	// a 4in6 spelling of our own addr is refused too
+	c.Settings["tun"] = map[string]any{"unsafe_routes": []any{map[string]any{"via": "::ffff:10.0.0.1", "route": "192.168.6.0/24"}}}
+	routes, err = parseUnsafeRoutes(c, []netip.Prefix{self})
+	assert.Nil(t, routes)
+	require.EqualError(t, err, "entry 1.via in tun.unsafe_routes is this host's own address; via: ::ffff:10.0.0.1")
+
+	// another address in our vpn network is not our own, it is a normal gateway
+	c.Settings["tun"] = map[string]any{"unsafe_routes": []any{map[string]any{"via": "10.0.0.2", "route": "192.168.6.0/24"}}}
+	routes, err = parseUnsafeRoutes(c, []netip.Prefix{self})
+	require.NoError(t, err)
+	assert.Len(t, routes, 1)
+
 	// below network range
 	c.Settings["tun"] = map[string]any{"unsafe_routes": []any{map[string]any{"via": "127.0.0.1", "route": "1.0.0.0/8"}}}
 	routes, err = parseUnsafeRoutes(c, []netip.Prefix{n})
@@ -446,6 +474,36 @@ func Test_getAllRoutesFromConfigCapsMTU(t *testing.T) {
 		mtus[r.Cidr.String()] = r.MTU
 	}
 	assert.Equal(t, map[string]int{"10.0.0.0/29": MaxMTU, "10.0.0.8/29": 1300, "1.0.0.0/29": MaxMTU}, mtus)
+}
+
+// An unsafe route through ourselves can never deliver a packet, and the handshake it starts is refused. The route
+// config is read on startup and reload, so both refuse it here with the entry that is wrong. (#1157)
+func Test_getAllRoutesFromConfigRejectsSelfVia(t *testing.T) {
+	l := test.NewLogger()
+	c := config.NewC(l)
+	networks := []netip.Prefix{netip.MustParsePrefix("10.0.0.1/24")}
+
+	c.Settings["tun"] = map[string]any{
+		"unsafe_routes": []any{map[string]any{"route": "192.168.6.0/24", "via": "10.0.0.1"}},
+	}
+	changed, routes, err := getAllRoutesFromConfig(l, c, networks, true)
+	assert.True(t, changed)
+	assert.Nil(t, routes)
+	require.ErrorContains(t, err, "Could not parse tun.unsafe_routes")
+	require.ErrorContains(t, err, "entry 1.via in tun.unsafe_routes is this host's own address; via: 10.0.0.1")
+
+	// A reload that introduces it is refused too, so the device keeps the routes it already had.
+	route := func(via string) string {
+		return "tun:\n  unsafe_routes:\n    - route: 192.168.6.0/24\n      via: " + via + "\n"
+	}
+	c = config.NewC(l)
+	require.NoError(t, c.LoadString(route("10.0.0.2")))
+	require.NoError(t, c.ReloadConfigString(route("10.0.0.1")).Err)
+
+	changed, routes, err = getAllRoutesFromConfig(l, c, networks, false)
+	assert.True(t, changed)
+	assert.Nil(t, routes)
+	require.ErrorContains(t, err, "entry 1.via in tun.unsafe_routes is this host's own address; via: 10.0.0.1")
 }
 
 // The route tree keeps one entry per CIDR, so a CIDR listed twice only routes by the last one. Say so instead of

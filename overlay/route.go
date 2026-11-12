@@ -290,6 +290,21 @@ func parseUnsafeRoutes(c *config.C, networks []netip.Prefix) ([]Route, error) {
 			return nil, fmt.Errorf("entry %v.via in tun.unsafe_routes is not a string or list of gateways: found %T", i+1, rVia)
 		}
 
+		// A route through ourselves can never work: the packet comes back up the tun and
+		// inside.go drops it as self addressed, after nebula has already tried to handshake
+		// with its own address. Refuse it here so the misconfiguration is named once.
+		for _, gateway := range gateways {
+			for _, network := range networks {
+				if gateway.Addr().Unmap() == network.Addr().Unmap() {
+					return nil, fmt.Errorf(
+						"entry %v.via in tun.unsafe_routes is this host's own address; via: %v",
+						i+1,
+						gateway.Addr(),
+					)
+				}
+			}
+		}
+
 		rRoute, ok := m["route"]
 		if !ok {
 			return nil, fmt.Errorf("entry %v.route in tun.unsafe_routes is not present", i+1)
