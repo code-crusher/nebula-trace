@@ -380,6 +380,61 @@ func newRemotesRaceFixture(t *testing.T, vpnAddr netip.Addr) (*HandshakeManager,
 	return hm, f, established
 }
 
+// TestHandleOutboundSkipsWrongFamilyRemote pins issue #1227 for the handshake path. A lighthouse reports every
+// address a peer has, so an IPv4 socket is handed the peer's IPv6 address too. Failing to send there is expected
+// and must stay at Debug even on the attempt that first sees a changed remote list, which otherwise shouts at Error.
+func TestHandleOutboundSkipsWrongFamilyRemote(t *testing.T) {
+	ca, _, caKey, _ := ct.NewTestCaCert(cert.Version2, cert.Curve_CURVE25519, time.Time{}, time.Time{}, nil, nil, nil)
+	pool := ct.NewTestCAPool(ca)
+	c, _, rawKey, _ := ct.NewTestCert(cert.Version2, cert.Curve_CURVE25519, ca, caKey,
+		"me", ca.NotBefore(), ca.NotAfter(), []netip.Prefix{netip.MustParsePrefix("10.0.0.1/24")}, nil, nil)
+	priv, _, _, err := cert.UnmarshalPrivateKeyFromPEM(rawKey)
+	require.NoError(t, err)
+	hsBytes, err := c.MarshalForHandshakes()
+	require.NoError(t, err)
+	cred := handshake.NewCredential(c, hsBytes, priv, noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256))
+
+	handler := &capturingHandler{}
+	logger := slog.New(handler)
+	pki := &PKI{}
+	pki.cs.Store(&CertState{initiatingVersion: cert.Version2, v2Credential: cred})
+	pki.caPool.Store(pool)
+
+	mainHM := newHostMap(logger)
+	preferredRanges := []netip.Prefix{}
+	mainHM.preferredRanges.Store(&preferredRanges)
+
+	conn := &wrongFamilyConn{}
+	hm := NewHandshakeManager(logger, mainHM, newTestLighthouse(), conn, defaultHandshakeConfig)
+	f := &Interface{
+		hostMap:            mainHM,
+		lightHouse:         hm.lightHouse,
+		handshakeManager:   hm,
+		relayManager:       &relayManager{hostmap: mainHM},
+		pki:                pki,
+		l:                  logger,
+		messageMetrics:     &MessageMetrics{txExhausted: metrics.NewCounter()},
+		myVpnAddrsTable:    new(bart.Lite),
+		myVpnNetworksTable: new(bart.Lite),
+	}
+	hm.f = f
+
+	vpnAddr := netip.MustParseAddr("10.0.0.2")
+	v6Remote := netip.MustParseAddrPort("[2001:db8::2]:4242")
+	hi := hm.StartHandshake(vpnAddr, func(hh *HandshakeHostInfo) {
+		hh.hostinfo.SetRemote(v6Remote)
+	})
+	require.NotNil(t, hi)
+
+	// The first attempt has a changed remote list, the case that used to log at Error.
+	hm.handleOutbound(vpnAddr, false)
+
+	assert.Empty(t, conn.writes, "a remote of the wrong family must not reach the socket")
+	entry := findEntry(t, handler.entries, "Failed to send handshake message")
+	assert.Equal(t, slog.LevelDebug, entry.Level)
+	require.ErrorIs(t, entry.Attrs["error"].(error), udp.ErrInvalidIPv6RemoteForSocket)
+}
+
 // With no handshake pending, tearing down the last tunnel still evicts the list.
 func Test_CloseTunnelEvictsWithoutPendingHandshake(t *testing.T) {
 	vpnAddr := netip.MustParseAddr("172.1.1.2")

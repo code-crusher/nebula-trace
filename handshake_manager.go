@@ -373,9 +373,11 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 		hm.messageMetrics.Tx(header.Handshake, hh.machine.Subtype(), 1)
 		err := hm.outside.WriteTo(stage0, addr)
 		if err != nil {
-			// These repeat every attempt, so match the success log below and only shout when the remotes changed
+			// These repeat every attempt, so match the success log below and only shout when the remotes changed.
+			// A remote our socket cannot address at all is expected, a lighthouse reports every family a peer has,
+			// and stays at Debug however the remote list changed.
 			level := slog.LevelDebug
-			if remotesHaveChanged {
+			if remotesHaveChanged && !errors.Is(err, udp.ErrInvalidIPv6RemoteForSocket) {
 				level = slog.LevelError
 			}
 
@@ -1181,10 +1183,16 @@ func (hm *HandshakeManager) sendHandshakeResponse(via ViaSender, msg []byte, hos
 	if !via.IsRelayed {
 		fields := append(logFields, "from", via)
 		err := f.outside.WriteTo(msg, via.UdpAddr)
-		if err != nil {
-			f.l.Error("Failed to send handshake message", append(fields, "error", err)...)
-		} else {
+		switch {
+		case err == nil:
 			f.l.Info("Handshake message sent", fields...)
+		case errors.Is(err, udp.ErrInvalidIPv6RemoteForSocket):
+			// We only answer a peer that reached us, so this should not happen; if it does, the peer's reply
+			// address is of a family our socket cannot use. Nothing to send, and the peer will retry.
+			f.l.Debug("Skipping handshake response to a remote our UDP socket cannot send to",
+				append(fields, "error", err)...)
+		default:
+			f.l.Error("Failed to send handshake message", append(fields, "error", err)...)
 		}
 	} else {
 		if via.relay == nil {

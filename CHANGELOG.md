@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A peer address our UDP socket cannot send to, such as a peer's IPv6 address on a node listening on IPv4, is now
+  skipped quietly instead of logging `listener is IPv4, but writing to IPv6 remote` at error level for every packet
+  and handshake attempt. The peer is usually still reachable at its other address, so the line read as the cause of a
+  problem rather than a routine skip. It is now a debug line that names the address being skipped, and a genuine
+  send failure still logs at error level. (#1227)
+
 ## [1.12.0] - 2026-10-29
 
 This release introduces udp/tun offloading support that can be enabled for greater performance. This will be enabled by default in a future release. See the `listen.udp_offloads` and `tun.use_offloads` example config settings for more details.

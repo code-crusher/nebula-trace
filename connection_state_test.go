@@ -1,6 +1,8 @@
 package nebula
 
 import (
+	"errors"
+	"log/slog"
 	"net/netip"
 	"strconv"
 	"sync"
@@ -162,6 +164,65 @@ func (c *capturingConn) WriteTo(b []byte, addr netip.AddrPort) error {
 	c.addrs = append(c.addrs, addr)
 	return nil
 }
+
+// wrongFamilyConn is a udp.Conn standing in for an IPv4 socket: it refuses IPv6 remotes the way the real listeners
+// do, so tests can drive the paths that used to log that refusal at Error level.
+type wrongFamilyConn struct {
+	udp.NoopConn
+	writes []netip.AddrPort
+}
+
+func (c *wrongFamilyConn) IPv4Only() bool { return true }
+
+func (c *wrongFamilyConn) WriteTo(_ []byte, addr netip.AddrPort) error {
+	if !addr.Addr().Unmap().Is4() {
+		return udp.ErrInvalidIPv6RemoteForSocket
+	}
+	c.writes = append(c.writes, addr)
+	return nil
+}
+
+// TestSendNoMetricsSkipsWrongFamilyRemote pins issue #1227: an IPv4 socket handed an IPv6 remote, as a lighthouse
+// routinely reports for a peer, is an expected skip and logs at Debug. It must not read as a send failure.
+func TestSendNoMetricsSkipsWrongFamilyRemote(t *testing.T) {
+	initR, _ := runTestHandshake(t)
+	ci, err := newConnectionStateFromResult(initR)
+	require.NoError(t, err)
+
+	handler := &capturingHandler{}
+	conn := &wrongFamilyConn{}
+	f := &Interface{
+		l:              slog.New(handler),
+		messageMetrics: &MessageMetrics{txExhausted: metrics.NewCounter()},
+		writers:        []udp.Conn{conn},
+	}
+	f.connectionManager = &connectionManager{intf: f}
+	hostinfo := &HostInfo{vpnAddrs: []netip.Addr{netip.MustParseAddr("10.0.0.1")}, ConnectionState: ci}
+	remote := netip.MustParseAddrPort("[2001:db8::2]:4242")
+
+	f.sendNoMetrics(header.Message, 0, ci, hostinfo, remote, []byte("payload"), make([]byte, 12), make([]byte, mtu), 0)
+
+	assert.Empty(t, conn.writes, "a remote of the wrong family must not reach the socket")
+	entry := findEntry(t, handler.entries, "Skipping remote our UDP socket cannot send to")
+	assert.Equal(t, slog.LevelDebug, entry.Level)
+	require.ErrorIs(t, entry.Attrs["error"].(error), udp.ErrInvalidIPv6RemoteForSocket)
+	assert.Equal(t, remote, entry.Attrs["udpAddr"])
+
+	// A genuine send failure keeps its Error level.
+	handler.entries = nil
+	f.writers = []udp.Conn{&failingConn{err: errors.New("sendto: no buffer space available")}}
+	f.sendNoMetrics(header.Message, 0, ci, hostinfo, netip.MustParseAddrPort("10.0.0.2:4242"), []byte("payload"), make([]byte, 12), make([]byte, mtu), 0)
+	entry = findEntry(t, handler.entries, "Failed to write outgoing packet")
+	assert.Equal(t, slog.LevelError, entry.Level)
+}
+
+// failingConn is a udp.Conn whose WriteTo always returns err.
+type failingConn struct {
+	udp.NoopConn
+	err error
+}
+
+func (c *failingConn) WriteTo([]byte, netip.AddrPort) error { return c.err }
 
 // TestSendNoMetricsViaRelay sends through a relay from the mtu sized buffer the cached packet flush uses. Payloads up
 // to overlay.MaxMTU go out intact, anything bigger is dropped rather than outgrowing the buffer, which once panicked.

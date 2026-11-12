@@ -2,6 +2,7 @@ package nebula
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"github.com/slackhq/nebula/overlay/batch"
 	"github.com/slackhq/nebula/overlay/tio"
 	"github.com/slackhq/nebula/routing"
+	"github.com/slackhq/nebula/udp"
 )
 
 func (f *Interface) consumeInsidePacket(pkt tio.Packet, fwPacket *firewall.ParsedPacket, nb []byte, sendBatch *batch.SendBatch, rejectBuf []byte, q int, localCache firewall.ConntrackCache) {
@@ -518,6 +520,16 @@ func (f *Interface) SendVia(via *HostInfo, relay *Relay, ad, nb, out []byte, noc
 
 	err = f.writers[q].WriteTo(toSend, via.GetRemote())
 	if err != nil {
+		if errors.Is(err, udp.ErrInvalidIPv6RemoteForSocket) {
+			// The relay's address is of a family our socket cannot send to, so the tunnel to it never forms. This
+			// repeats for every packet; the handshake timeout is the useful signal, not this line.
+			if f.l.Enabled(context.Background(), slog.LevelDebug) {
+				if l, ok := logging.RateLimited(f.l, f.udpRelayTxErrLimiter); ok {
+					via.logger(l).Debug("Skipping relay our UDP socket cannot send to", "error", err)
+				}
+			}
+			return
+		}
 		if l, ok := logging.RateLimited(f.l, f.udpRelayTxErrLimiter); ok {
 			via.logger(l).Info("Failed to WriteTo in sendVia", "error", err)
 		}
@@ -593,25 +605,9 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 	}
 
 	if remote.IsValid() {
-		err = f.writers[q].WriteTo(out, remote)
-		if err != nil {
-			if l, ok := logging.RateLimited(f.l, f.udpTxErrLimiter); ok {
-				hostinfo.logger(l).Error("Failed to write outgoing packet",
-					"error", err,
-					"udpAddr", remote,
-				)
-			}
-		}
+		f.writeToRemote(hostinfo, q, out, remote)
 	} else if hr := hostinfo.GetRemote(); hr.IsValid() {
-		err = f.writers[q].WriteTo(out, hr)
-		if err != nil {
-			if l, ok := logging.RateLimited(f.l, f.udpTxErrLimiter); ok {
-				hostinfo.logger(l).Error("Failed to write outgoing packet",
-					"error", err,
-					"udpAddr", hr,
-				)
-			}
-		}
+		f.writeToRemote(hostinfo, q, out, hr)
 	} else {
 		// Try to send via a relay
 		for _, relayIP := range hostinfo.relayState.CopyRelayIps() {
@@ -627,5 +623,38 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 			f.SendVia(relayHostInfo, relay, out, nb, fullOut[:header.Len+len(out)], true, q)
 			break
 		}
+	}
+}
+
+// writeToRemote sends an encrypted packet to remote on writer q.
+// A remote of the other address family than our socket is not a failure: a lighthouse reports every address a peer
+// has, so an IPv4 socket is routinely handed an IPv6 address and the peer is still reachable over IPv4. Those skips
+// log at Debug, once per second, instead of shouting the "listener is IPv4, but writing to IPv6 remote" error that
+// users mistake for the cause of their problem.
+func (f *Interface) writeToRemote(hostinfo *HostInfo, q int, out []byte, remote netip.AddrPort) {
+	err := f.writers[q].WriteTo(out, remote)
+	if err == nil {
+		return
+	}
+
+	if errors.Is(err, udp.ErrInvalidIPv6RemoteForSocket) {
+		// Check Enabled before the limiter so a debug line nobody will see cannot spend the token a real
+		// failure needs.
+		if f.l.Enabled(context.Background(), slog.LevelDebug) {
+			if l, ok := logging.RateLimited(f.l, f.udpTxErrLimiter); ok {
+				hostinfo.logger(l).Debug("Skipping remote our UDP socket cannot send to",
+					"error", err,
+					"udpAddr", remote,
+				)
+			}
+		}
+		return
+	}
+
+	if l, ok := logging.RateLimited(f.l, f.udpTxErrLimiter); ok {
+		hostinfo.logger(l).Error("Failed to write outgoing packet",
+			"error", err,
+			"udpAddr", remote,
+		)
 	}
 }
