@@ -189,7 +189,11 @@ func signCert(args []string, out io.Writer, errOut io.Writer, pr PasswordReader)
 		}
 	}
 
-	if caCert.Expired(time.Now()) {
+	now := time.Now()
+	if cert.NotYetValid(caCert, now) {
+		return fmt.Errorf("ca certificate is not valid until %s", caCert.NotBefore().Format(time.RFC3339))
+	}
+	if caCert.Expired(now) {
 		return fmt.Errorf("ca certificate is expired")
 	}
 

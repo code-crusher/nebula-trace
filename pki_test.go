@@ -288,6 +288,11 @@ func TestLoadCAPoolSkipsUnsupported(t *testing.T) {
 	_, err = load(append(append([]byte{}, expiredPEM...), newVersionPEM...))
 	require.EqualError(t, err, "no valid CA certificates present")
 
+	// A CA that is not valid yet is also skipped, and a pool of only those is not usable
+	_, _, _, notYetValidPEM := cert_test.NewTestCaCert(cert.Version2, cert.Curve_CURVE25519, time.Now().Add(time.Hour), time.Now().Add(2*time.Hour), nil, nil, nil)
+	_, err = load(append(append([]byte{}, notYetValidPEM...), newVersionPEM...))
+	require.EqualError(t, err, "no valid CA certificates present")
+
 	// A CA for a newer curve is skipped the same way
 	pool, err = load(append(append([]byte{}, cert_test.WithCurve(caPEM, cert.Curve(2))...), caPEM...))
 	require.NoError(t, err)
@@ -347,4 +352,28 @@ func TestPKICertSkipsUnsupported(t *testing.T) {
 	_, _, _, expiredHostPEM := cert_test.NewTestCert(cert.Version2, cert.Curve_CURVE25519, oldCA, oldCAKey, "host", time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour), []netip.Prefix{netip.MustParsePrefix("10.1.0.2/24")}, nil, nil)
 	_, err = load(append(append([]byte{}, cert_test.WithCurve(expiredHostPEM, cert.Curve(2))...), certPEM...))
 	require.NoError(t, err)
+}
+
+// A host certificate whose NotBefore is in the future used to be reported as expired, which sent operators looking for
+// the wrong problem. The error now says the certificate is not valid yet and includes the NotBefore it is waiting on.
+func TestPKICertNotYetValid(t *testing.T) {
+	now := time.Now()
+	ca, _, caKey, caPEM := cert_test.NewTestCaCert(cert.Version2, cert.Curve_CURVE25519, now.Add(-time.Hour), now.Add(2*time.Hour), nil, nil, nil)
+	notBefore := now.Add(10 * time.Minute).Truncate(time.Second)
+	crt, _, keyPEM, certPEM := cert_test.NewTestCert(cert.Version2, cert.Curve_CURVE25519, ca, caKey, "host", notBefore, now.Add(time.Hour), []netip.Prefix{netip.MustParsePrefix("10.1.0.2/24")}, nil, nil)
+
+	c := config.NewC(test.NewLogger())
+	require.NoError(t, c.LoadString(fmt.Sprintf("pki:\n  ca: %q\n  cert: %q\n  key: %q\n", caPEM, certPEM, keyPEM)))
+	_, err := NewPKIFromConfig(test.NewLogger(), c)
+	require.ErrorIs(t, err, cert.ErrNotYetValid)
+	require.NotErrorIs(t, err, cert.ErrExpired)
+	require.ErrorContains(t, err, "nebula certificate for this host is not valid until "+crt.NotBefore().Format(time.RFC3339))
+
+	// A certificate past its NotAfter is still reported as expired
+	_, _, expiredKeyPEM, expiredPEM := cert_test.NewTestCert(cert.Version2, cert.Curve_CURVE25519, ca, caKey, "host", now.Add(-time.Hour), now.Add(-time.Minute), []netip.Prefix{netip.MustParsePrefix("10.1.0.2/24")}, nil, nil)
+	c = config.NewC(test.NewLogger())
+	require.NoError(t, c.LoadString(fmt.Sprintf("pki:\n  ca: %q\n  cert: %q\n  key: %q\n", caPEM, expiredPEM, expiredKeyPEM)))
+	_, err = NewPKIFromConfig(test.NewLogger(), c)
+	require.ErrorContains(t, err, "nebula certificate for this host is expired")
+	require.NotErrorIs(t, err, cert.ErrNotYetValid)
 }

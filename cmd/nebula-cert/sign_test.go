@@ -531,3 +531,32 @@ func Test_signCert_stdio(t *testing.T) {
 	assert.Equal(t, "in-pub-test", stdinCrt.Name())
 	assert.Equal(t, inPub, stdinCrt.PublicKey())
 }
+
+// A signing CA whose NotBefore is in the future is refused with an error that names the time to wait for, rather than
+// being reported as expired.
+func Test_signCert_CANotYetValid(t *testing.T) {
+	ob := &bytes.Buffer{}
+	eb := &bytes.Buffer{}
+	nopw := &StubPasswordReader{password: []byte("")}
+
+	caPub, caPriv, _ := ed25519.GenerateKey(rand.Reader)
+	notBefore := time.Now().Add(10 * time.Minute).Truncate(time.Second)
+	ca, _ := NewTestCaCert("ca", caPub, caPriv, notBefore, notBefore.Add(time.Hour), nil, nil, nil)
+	caPEM, err := ca.MarshalPEM()
+	require.NoError(t, err)
+
+	caKeyF, err := os.CreateTemp("", "sign-cert-nb.key")
+	require.NoError(t, err)
+	defer os.Remove(caKeyF.Name())
+	_, _ = caKeyF.Write(cert.MarshalSigningPrivateKeyToPEM(cert.Curve_CURVE25519, caPriv))
+
+	caCrtF, err := os.CreateTemp("", "sign-cert-nb.crt")
+	require.NoError(t, err)
+	defer os.Remove(caCrtF.Name())
+	_, _ = caCrtF.Write(caPEM)
+
+	args := []string{"-version", "1", "-ca-crt", caCrtF.Name(), "-ca-key", caKeyF.Name(), "-name", "test", "-ip", "1.1.1.1/24", "-out-crt", "nope", "-out-key", "nope", "-duration", "100m"}
+	require.EqualError(t, signCert(args, ob, eb, nopw), "ca certificate is not valid until "+notBefore.Format(time.RFC3339))
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
+}

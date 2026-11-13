@@ -8,7 +8,9 @@ import (
 var (
 	ErrBadFormat                  = errors.New("bad wire format")
 	ErrRootExpired                = errors.New("root certificate is expired")
+	ErrRootNotYetValid            = errors.New("root certificate is not yet valid")
 	ErrExpired                    = errors.New("certificate is expired")
+	ErrNotYetValid                = errors.New("certificate is not yet valid")
 	ErrNotCA                      = errors.New("certificate is not a CA")
 	ErrNotSelfSigned              = errors.New("certificate is not self-signed")
 	ErrBlockListed                = errors.New("certificate is in the block list")

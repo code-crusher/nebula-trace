@@ -797,3 +797,72 @@ func TestCertificateV2_CurveMismatch(t *testing.T) {
 	_, err = caPool.verify(c, time.Now(), fp, c.Issuer())
 	require.Error(t, err)
 }
+
+// A certificate whose NotBefore is in the future is reported as not yet valid, not as expired, so the caller can tell
+// a clock that is behind apart from a certificate that is past its NotAfter.
+func TestCAPool_VerifyNotYetValid(t *testing.T) {
+	for _, v := range []Version{Version1, Version2} {
+		for _, curve := range []Curve{Curve_CURVE25519, Curve_P256} {
+			now := time.Now()
+			ca, _, caKey, _ := NewTestCaCert(v, curve, now.Add(-time.Hour), now.Add(time.Hour), nil, nil, nil)
+			c, _, _, _ := NewTestCert(v, curve, ca, caKey, "test", now.Add(5*time.Minute), now.Add(30*time.Minute), nil, nil, nil)
+
+			caPool := NewCAPool()
+			require.NoError(t, caPool.AddCA(ca))
+
+			// Before NotBefore the cert is not yet valid, not expired
+			_, err := caPool.VerifyCertificate(now, c)
+			require.ErrorIs(t, err, ErrNotYetValid)
+			require.NotErrorIs(t, err, ErrExpired)
+			require.EqualError(t, err, "certificate is not yet valid")
+
+			// Once NotBefore has passed the cert verifies, and past NotAfter it is expired rather than not yet valid
+			_, err = caPool.VerifyCertificate(now.Add(10*time.Minute), c)
+			require.NoError(t, err)
+			_, err = caPool.VerifyCertificate(now.Add(40*time.Minute), c)
+			require.ErrorIs(t, err, ErrExpired)
+			require.NotErrorIs(t, err, ErrNotYetValid)
+
+			// A CA that is not yet valid is reported as such, distinct from an expired root
+			caNow := time.Now()
+			futureCA, _, futureCAKey, _ := NewTestCaCert(v, curve, caNow.Add(10*time.Minute), caNow.Add(time.Hour), nil, nil, nil)
+			futureCert, _, _, _ := NewTestCert(v, curve, futureCA, futureCAKey, "test", caNow.Add(10*time.Minute), caNow.Add(30*time.Minute), nil, nil, nil)
+
+			// The CA is still placed in the pool even though it is not usable yet
+			futurePool := NewCAPool()
+			require.ErrorIs(t, futurePool.AddCA(futureCA), ErrNotYetValid)
+			_, err = futurePool.VerifyCertificate(caNow, futureCert)
+			require.ErrorIs(t, err, ErrRootNotYetValid)
+			require.NotErrorIs(t, err, ErrRootExpired)
+			require.EqualError(t, err, "root certificate is not yet valid")
+		}
+	}
+}
+
+// AddCA reports a CA that is not yet valid separately from one that is expired, and neither is treated as unsupported
+// when the pool is built from a PEM bundle.
+func TestCAPool_AddCANotYetValid(t *testing.T) {
+	now := time.Now()
+	ca, _, _, caPEM := NewTestCaCert(Version2, Curve_CURVE25519, now.Add(10*time.Minute), now.Add(time.Hour), nil, nil, nil)
+
+	err := NewCAPool().AddCA(ca)
+	require.ErrorIs(t, err, ErrNotYetValid)
+	require.NotErrorIs(t, err, ErrExpired)
+	require.EqualError(t, err, `"test ca": certificate is not yet valid`)
+
+	pool, err := NewCAPoolFromPEM(caPEM)
+	require.NotNil(t, pool)
+	require.ErrorIs(t, err, ErrNotYetValid)
+	require.NotErrorIs(t, err, ErrExpired)
+	assert.Nil(t, SkippedCertificates(err))
+
+	// A not yet valid CA alongside a usable one still builds a pool, the same way an expired one does
+	good, _, _, goodPEM := NewTestCaCert(Version2, Curve_CURVE25519, now.Add(-time.Hour), now.Add(time.Hour), nil, nil, nil)
+	goodFP, err := good.Fingerprint()
+	require.NoError(t, err)
+
+	pool, err = NewCAPoolFromPEM(appendByteSlices(caPEM, goodPEM))
+	require.NotNil(t, pool)
+	require.ErrorIs(t, err, ErrNotYetValid)
+	assert.Contains(t, pool.CAs, goodFP)
+}

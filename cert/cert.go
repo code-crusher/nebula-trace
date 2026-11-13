@@ -191,6 +191,12 @@ func (c Curve) Known() bool {
 	return c == Curve_CURVE25519 || c == Curve_P256
 }
 
+// NotYetValid is true if the certificate does not become valid until after t.
+// Expired also returns true for a certificate that is not yet valid, test NotYetValid first to tell the two apart.
+func NotYetValid(c Certificate, t time.Time) bool {
+	return t.Before(c.NotBefore())
+}
+
 // CheckKnownCurve returns an ErrUnknownCurve if c is for a curve this version of nebula can not use.
 func CheckKnownCurve(c Certificate) error {
 	if c.Curve().Known() {

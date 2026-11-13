@@ -579,7 +579,11 @@ func loadCertificate(b []byte) (cert.Certificate, []byte, error) {
 		return nil, b, err
 	}
 
-	if c.Expired(time.Now()) {
+	now := time.Now()
+	if cert.NotYetValid(c, now) {
+		return nil, b, fmt.Errorf("nebula certificate for this host is not valid until %s: %w", c.NotBefore().Format(time.RFC3339), cert.ErrNotYetValid)
+	}
+	if c.Expired(now) {
 		return nil, b, fmt.Errorf("nebula certificate for this host is expired")
 	}
 
@@ -623,15 +627,19 @@ func loadCAPoolFromConfig(l *slog.Logger, c *config.C) (*cert.CAPool, error) {
 			l.Warn("Skipping a CA certificate that this version of nebula does not support", "error", e)
 		}
 
-		var expired int
+		var invalid int
+		now := time.Now()
 		for _, crt := range caPool.CAs {
-			if crt.Certificate.Expired(time.Now()) {
-				expired++
+			if cert.NotYetValid(crt.Certificate, now) {
+				invalid++
+				l.Warn("not yet valid certificate present in CA pool", "cert", crt, "notBefore", crt.Certificate.NotBefore())
+			} else if crt.Certificate.Expired(now) {
+				invalid++
 				l.Warn("expired certificate present in CA pool", "cert", crt)
 			}
 		}
 
-		if expired >= len(caPool.CAs) {
+		if invalid >= len(caPool.CAs) {
 			return nil, errors.New("no valid CA certificates present")
 		}
 	}

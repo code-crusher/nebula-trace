@@ -29,10 +29,11 @@ func NewCAPool() *CAPool {
 // NewCAPoolFromPEM will create a new CA pool from the provided
 // input bytes, which must be a PEM-encoded set of nebula certificates.
 // If the pool contains any expired certificates, an ErrExpired will be
-// returned along with the pool. Certificates this version of nebula does not
+// returned along with the pool, and a certificate whose NotBefore is in the
+// future yields an ErrNotYetValid. Certificates this version of nebula does not
 // support, an unknown version or curve, are left out and their errors are
-// returned along with the pool too, joined with any ErrExpired. A nil pool
-// means the input could not be used at all. The caller must handle any such errors.
+// returned along with the pool too, joined with any ErrExpired or ErrNotYetValid.
+// A nil pool means the input could not be used at all. The caller must handle any such errors.
 func NewCAPoolFromPEM(caPEMs []byte) (*CAPool, error) {
 	return NewCAPoolFromPEMReader(bytes.NewReader(caPEMs))
 }
@@ -43,6 +44,7 @@ func NewCAPoolFromPEMReader(r io.Reader) (*CAPool, error) {
 	pool := NewCAPool()
 
 	var expired bool
+	var notYetValid bool
 	var skipped []error
 
 	scanner := NewPEMScanner(r)
@@ -67,7 +69,10 @@ func NewCAPoolFromPEMReader(r io.Reader) (*CAPool, error) {
 		}
 
 		err = pool.AddCA(c)
-		if errors.Is(err, ErrExpired) {
+		if errors.Is(err, ErrNotYetValid) {
+			notYetValid = true
+			continue
+		} else if errors.Is(err, ErrExpired) {
 			expired = true
 			continue
 		} else if errors.Is(err, ErrUnknownCurve) {
@@ -81,14 +86,20 @@ func NewCAPoolFromPEMReader(r io.Reader) (*CAPool, error) {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidPEMBlock, err)
 	}
 
+	var invalid []error
 	if expired {
-		if len(skipped) == 0 {
-			return pool, ErrExpired
-		}
-		skipped = append(skipped, ErrExpired)
+		invalid = append(invalid, ErrExpired)
+	}
+	if notYetValid {
+		invalid = append(invalid, ErrNotYetValid)
 	}
 
-	return pool, errors.Join(skipped...)
+	// A lone validity error is returned as itself, the pool is still usable and the caller may compare it directly
+	if len(skipped) == 0 && len(invalid) == 1 {
+		return pool, invalid[0]
+	}
+
+	return pool, errors.Join(append(skipped, invalid...)...)
 }
 
 // SkippedCertificates returns an error for each certificate NewCAPoolFromPEM or NewCAPoolFromPEMReader left out of
@@ -101,7 +112,7 @@ func SkippedCertificates(err error) []error {
 
 	var skipped []error
 	for _, e := range joined.Unwrap() {
-		if !errors.Is(e, ErrExpired) {
+		if !errors.Is(e, ErrExpired) && !errors.Is(e, ErrNotYetValid) {
 			skipped = append(skipped, e)
 		}
 	}
@@ -156,7 +167,11 @@ func (ncp *CAPool) AddCA(c Certificate) error {
 
 	ncp.CAs[sum] = cc
 
-	if c.Expired(time.Now()) {
+	now := time.Now()
+	if NotYetValid(c, now) {
+		return fmt.Errorf("%s: %w", QuoteName(c.Name()), ErrNotYetValid)
+	}
+	if c.Expired(now) {
 		return fmt.Errorf("%s: %w", QuoteName(c.Name()), ErrExpired)
 	}
 
@@ -253,8 +268,16 @@ func (ncp *CAPool) verify(c Certificate, now time.Time, certFp string, signerFp 
 		return nil, ErrCurveMismatch
 	}
 
+	if NotYetValid(signer.Certificate, now) {
+		return nil, ErrRootNotYetValid
+	}
+
 	if signer.Certificate.Expired(now) {
 		return nil, ErrRootExpired
+	}
+
+	if NotYetValid(c, now) {
+		return nil, ErrNotYetValid
 	}
 
 	if c.Expired(now) {
