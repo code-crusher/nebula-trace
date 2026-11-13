@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `sshd.certificate_authorities` accepts trusted SSH CA public keys with limits on the certificates
+  they sign: `allow_users` for the user names that may log in and `allow_groups` for the groups,
+  read from a certificate's `groups@nebula` extension, at least one of which a certificate must
+  carry. A CA key is a public key string or a path to a file holding one. The existing
+  `sshd.trusted_cas` keeps admitting any certificate the CA signed. (#1076)
+
 ## [1.12.0] - 2026-10-29
 
 This release introduces udp/tun offloading support that can be enabled for greater performance. This will be enabled by default in a future release. See the `listen.udp_offloads` and `tun.use_offloads` example config settings for more details.

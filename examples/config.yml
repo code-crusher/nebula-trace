@@ -234,6 +234,21 @@ punchy:
   # Trusted SSH CA public keys. These are the public keys of the CAs that are allowed to sign SSH keys for access.
   #trusted_cas:
     #- "ssh public key string"
+  # Trusted SSH CA public keys with limits on what the certificates they sign may allow. Each entry
+  # is a list of CA keys, either a public key string or a path to a file containing one, and
+  # optionally the users and groups a certificate may carry:
+  # - allow_users lists the user names that may log in with a certificate this CA signed, any when
+  #   missing
+  # - allow_groups lists the groups, from the certificate's groups@nebula extension, at least one
+  #   of which a certificate must carry, any when missing
+  #certificate_authorities:
+    #- keys:
+        #- "/etc/ssh/user_ca_key.pub"
+      #allow_users:
+        #- "steeeeve"
+      #allow_groups:
+        #- "sysadmins"
+        #- "team-dev1"
 
 # Local APIs allow accessing running nebula state.
 #local_api:

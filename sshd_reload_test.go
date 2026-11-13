@@ -147,9 +147,10 @@ func TestSSHDReload_UnchangedKeepsSessions(t *testing.T) {
 // Every key the server reads restarts it when it changes
 func TestSSHDReload_ChangedConfigRestarts(t *testing.T) {
 	cases := map[string]func(t *testing.T, h *sshdReloadHarness){
-		"listen":           func(t *testing.T, h *sshdReloadHarness) { h.listen = "localhost:0" },
-		"authorized_users": func(t *testing.T, h *sshdReloadHarness) { h.users = append(h.users, "other") },
-		"trusted_cas":      func(t *testing.T, h *sshdReloadHarness) { h.extra = "  trusted_cas: []\n" },
+		"listen":                  func(t *testing.T, h *sshdReloadHarness) { h.listen = "localhost:0" },
+		"authorized_users":        func(t *testing.T, h *sshdReloadHarness) { h.users = append(h.users, "other") },
+		"trusted_cas":             func(t *testing.T, h *sshdReloadHarness) { h.extra = "  trusted_cas: []\n" },
+		"certificate_authorities": func(t *testing.T, h *sshdReloadHarness) { h.extra = "  certificate_authorities: []\n" },
 		"host_key": func(t *testing.T, h *sshdReloadHarness) {
 			h.keyFile = filepath.Join(t.TempDir(), "other_host_key")
 			h.writeHostKey(t, newEd25519Key(t))

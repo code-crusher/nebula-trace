@@ -46,7 +46,7 @@ func wireSSHReload(l *slog.Logger, ssh *sshd.SSHServer, c *config.C) {
 }
 
 // sshdServerKeys are what configSSH reads
-var sshdServerKeys = []string{"sshd.enabled", "sshd.listen", "sshd.host_key", "sshd.trusted_cas", "sshd.authorized_users"}
+var sshdServerKeys = []string{"sshd.enabled", "sshd.listen", "sshd.host_key", "sshd.trusted_cas", "sshd.certificate_authorities", "sshd.authorized_users"}
 
 // loadSSHHostKey returns sshd.host_key, read from its file when it names one.
 func loadSSHHostKey(c *config.C) ([]byte, error) {
@@ -62,6 +62,26 @@ func loadSSHHostKey(c *config.C) ([]byte, error) {
 		return nil, fmt.Errorf("error while loading sshd.host_key file: %s", err)
 	}
 	return b, nil
+}
+
+// stringSlice reads v as a list of strings, nil means absent
+func stringSlice(v any) ([]string, error) {
+	switch t := v.(type) {
+	case nil:
+		return nil, nil
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, e := range t {
+			s, ok := e.(string)
+			if !ok {
+				return nil, fmt.Errorf("entry is not a string: %v", e)
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("expected a list, got: %v", v)
+	}
 }
 
 // configSSH reads the ssh info out of the passed-in Config and
@@ -99,11 +119,71 @@ func configSSH(l *slog.Logger, ssh *sshd.SSHServer, c *config.C, r *config.Reloa
 
 	rawCAs := c.GetStringSlice("sshd.trusted_cas", []string{})
 	for _, caAuthorizedKey := range rawCAs {
-		err := ssh.AddTrustedCA(caAuthorizedKey)
+		err := ssh.AddTrustedCA(caAuthorizedKey, nil, nil)
 		if err != nil {
 			l.Warn("SSH CA had an error, ignoring", "error", err, "sshCA", caAuthorizedKey)
 			r.Failed()
 			continue
+		}
+	}
+
+	rawCAConfigs := c.Get("sshd.certificate_authorities")
+	caConfigs, ok := rawCAConfigs.([]any)
+	if ok {
+		for _, rc := range caConfigs {
+			caDef, ok := rc.(map[string]any)
+			if !ok {
+				l.Warn("Certificate authority had an error, ignoring", "sshCAConfig", rc)
+				r.Failed()
+				continue
+			}
+
+			users, err := stringSlice(caDef["allow_users"])
+			if err != nil {
+				l.Warn("Certificate authority had an error, ignoring",
+					"error", err,
+					"sshCAConfig", rc,
+					"sshCAKey", "allow_users",
+				)
+				r.Failed()
+				continue
+			}
+			groups, err := stringSlice(caDef["allow_groups"])
+			if err != nil {
+				l.Warn("Certificate authority had an error, ignoring",
+					"error", err,
+					"sshCAConfig", rc,
+					"sshCAKey", "allow_groups",
+				)
+				r.Failed()
+				continue
+			}
+
+			keysRaw, ok := caDef["keys"].([]any)
+			if !ok {
+				l.Warn("Certificate authority is missing the keys field or was not understood", "sshCAConfig", rc)
+				r.Failed()
+				continue
+			}
+
+			for _, key := range keysRaw {
+				strKey, ok := key.(string)
+				if !ok {
+					l.Warn("Did not understand ssh CA key",
+						"sshCAConfig", rc,
+						"sshCAKey", key,
+					)
+					r.Failed()
+					continue
+				}
+
+				err := ssh.AddTrustedCA(strKey, users, groups)
+				if err != nil {
+					l.Warn("SSH CA had an error, ignoring", "error", err, "sshCA", strKey)
+					r.Failed()
+					continue
+				}
+			}
 		}
 	}
 

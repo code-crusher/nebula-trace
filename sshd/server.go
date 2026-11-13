@@ -1,7 +1,6 @@
 package sshd
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -27,7 +26,7 @@ type SSHServer struct {
 	authLock sync.RWMutex
 	// Map of user -> authorized keys
 	trustedKeys map[string]map[string]bool
-	trustedCAs  []ssh.PublicKey
+	trustedCAs  []certAuthority
 
 	// Available commands.
 	commands *commands.Registry
@@ -55,17 +54,7 @@ func NewSSHServer(ctx context.Context, l *slog.Logger, reg *commands.Registry) (
 	}
 
 	cc := ssh.CertChecker{
-		IsUserAuthority: func(auth ssh.PublicKey) bool {
-			s.authLock.RLock()
-			defer s.authLock.RUnlock()
-			for _, ca := range s.trustedCAs {
-				if bytes.Equal(ca.Marshal(), auth.Marshal()) {
-					return true
-				}
-			}
-
-			return false
-		},
+		IsUserAuthority: s.isUserAuthority,
 		UserKeyFallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 			pk := string(pubKey.Marshal())
 			fp := ssh.FingerprintSHA256(pubKey)
@@ -93,7 +82,26 @@ func NewSSHServer(ctx context.Context, l *slog.Logger, reg *commands.Registry) (
 		},
 	}
 
-	s.authenticate = cc.Authenticate
+	// authorize wraps CertChecker.Authenticate so the user and group limits a trusted CA was
+	// configured with are enforced once the certificate itself has checked out
+	authenticate := func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+		perms, err := cc.Authenticate(c, pubKey)
+		if err != nil {
+			return nil, err
+		}
+		if cert, ok := pubKey.(*ssh.Certificate); ok {
+			err = s.authorizeCert(c.User(), cert)
+			if err != nil {
+				return nil, err
+			}
+			if perms.Extensions == nil {
+				perms.Extensions = make(map[string]string)
+			}
+			perms.Extensions["fp"] = ssh.FingerprintSHA256(cert.Key)
+		}
+		return perms, nil
+	}
+	s.authenticate = authenticate
 	s.config.Store(s.newConfig())
 
 	return s, nil
@@ -133,7 +141,7 @@ func (s *SSHServer) Running() bool {
 
 func (s *SSHServer) ClearTrustedCAs() {
 	s.authLock.Lock()
-	s.trustedCAs = []ssh.PublicKey{}
+	s.trustedCAs = []certAuthority{}
 	s.authLock.Unlock()
 }
 
@@ -143,17 +151,19 @@ func (s *SSHServer) ClearAuthorizedKeys() {
 	s.authLock.Unlock()
 }
 
-// AddTrustedCA adds a trusted CA for user certificates
-func (s *SSHServer) AddTrustedCA(pubKey string) error {
-	pk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pubKey))
+// AddTrustedCA adds a trusted CA for user certificates, optionally limited to the users and
+// groups a certificate may carry, per the sshd.certificate_authorities option of the same name.
+// pubKey is a public key string or the path to a file holding one.
+func (s *SSHServer) AddTrustedCA(pubKey string, users, groups []string) error {
+	pk, err := parseCACert(pubKey)
 	if err != nil {
 		return err
 	}
 
 	s.authLock.Lock()
-	s.trustedCAs = append(s.trustedCAs, pk)
+	s.trustedCAs = append(s.trustedCAs, certAuthority{key: pk, users: users, groups: groups})
 	s.authLock.Unlock()
-	s.l.Info("Trusted CA key", "sshKey", pubKey)
+	s.l.Info("Trusted CA key", "sshKey", pubKey, "sshCAUsers", users, "sshCAGroups", groups)
 	return nil
 }
 
