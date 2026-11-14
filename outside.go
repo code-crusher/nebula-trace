@@ -540,7 +540,34 @@ func (f *Interface) handleRecvError(addr netip.AddrPort, h *header.H) {
 
 	hostinfo := f.hostMap.QueryReverseIndex(h.RemoteIndex)
 	if hostinfo == nil {
-		f.l.Debug("Did not find remote index in main hostmap", "remoteIndex", h.RemoteIndex)
+		// A relayed packet carries the index of the relay it was sent through, not the main index of
+		// the peer that sent it, so the sender mirrors back an index that only the Relays table knows.
+		relayHostInfo, relay := f.hostMap.QueryRelayReverseIndex(addr, h.RemoteIndex)
+		if relay == nil {
+			f.l.Debug("Did not find remote index in main or relay hostmap", "remoteIndex", h.RemoteIndex)
+			return
+		}
+
+		hr := relayHostInfo.GetRemote()
+		if hr.IsValid() && hr != addr {
+			f.l.Info("Someone spoofing recv_errors?",
+				"addr", addr,
+				"hostinfoRemote", hr,
+			)
+			return
+		}
+
+		// The relay could not be used. Mark it Disestablished so the relay manager rebuilds it on the
+		// next handshake attempt to the target, rather than tearing down the direct tunnel to the
+		// relay, which is still healthy.
+		if relay.State != Disestablished {
+			relayHostInfo.relayState.UpdateRelayForByIdxState(relay.LocalIndex, Disestablished)
+			f.l.Info("Recv error received for a relayed packet, relay marked disestablished",
+				"index", h.RemoteIndex,
+				"udpAddr", addr,
+				"relayTo", relay.PeerAddr,
+			)
+		}
 		return
 	}
 

@@ -586,6 +586,42 @@ func (hm *HostMap) QueryReverseIndex(index uint32) *HostInfo {
 	}
 }
 
+// QueryRelayReverseIndex returns the HostInfo holding the relay that remote index refers to, along
+// with the relay itself, or nil if no relay uses it. A relayed packet carries a relay index in place
+// of the main index of the peer that sent it, so a peer that cannot process one mirrors an index
+// that is only in the Relays table and never in RemoteIndexes.
+//
+// Relay remote indexes are allocated by the relay host, so they are only unique per host. A match
+// whose host is reachable at addr is preferred, since that is the only one a recv error from addr
+// can mean. When no match is at addr the first index match is returned and the caller's spoof check
+// rejects it, the same as a direct peer whose remote does not match.
+func (hm *HostMap) QueryRelayReverseIndex(addr netip.AddrPort, index uint32) (*HostInfo, *Relay) {
+	// A relay that has not completed its handshake has no remote index, don't let a zero index in a
+	// recv_error match every one of them.
+	if index == 0 {
+		return nil, nil
+	}
+
+	var fallbackHI *HostInfo
+	var fallback *Relay
+
+	hm.RLock()
+	defer hm.RUnlock()
+	for localIdx, h := range hm.Relays {
+		r, ok := h.relayState.QueryRelayForByIdx(localIdx)
+		if !ok || r.RemoteIndex != index {
+			continue
+		}
+		if hr := h.GetRemote(); hr.IsValid() && hr == addr {
+			return h, r
+		}
+		if fallback == nil {
+			fallbackHI, fallback = h, r
+		}
+	}
+	return fallbackHI, fallback
+}
+
 func (hm *HostMap) QueryVpnAddr(vpnIp netip.Addr) *HostInfo {
 	return hm.queryVpnAddr(vpnIp, nil)
 }

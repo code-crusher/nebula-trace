@@ -219,6 +219,87 @@ func TestHostMap_QueryVpnAddrsRelayFor_NonPrimary(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestHostMap_QueryRelayReverseIndex covers the lookup a recv_error for a relayed packet needs: the
+// index in that packet is the relay index, which lives only in the Relays table.
+func TestHostMap_QueryRelayReverseIndex(t *testing.T) {
+	l := test.NewLogger()
+	hm := newHostMap(l)
+	f := &Interface{}
+	relayAddr := netip.MustParseAddr("0.0.0.9")
+	relayRemote := netip.MustParseAddrPort("192.0.2.9:4242")
+	target := netip.MustParseAddr("0.0.0.1")
+	otherTarget := netip.MustParseAddr("0.0.0.2")
+
+	relayHI := &HostInfo{
+		vpnAddrs:     []netip.Addr{relayAddr},
+		localIndexId: 1,
+		relayState: RelayState{
+			relayForByAddr: map[netip.Addr]*Relay{},
+			relayForByIdx:  map[uint32]*Relay{},
+		},
+	}
+	u := relayRemote
+	relayHI.remote.Store(&u)
+	hm.unlockedAddHostInfo(relayHI, f)
+
+	// An index no relay has claimed does not match.
+	h, r := hm.QueryRelayReverseIndex(relayRemote, 100)
+	assert.Nil(t, h)
+	assert.Nil(t, r)
+
+	// A relay that has not completed its handshake has no remote index, so a zero index in a
+	// recv_error must not match it.
+	hm.Relays[100] = relayHI
+	relayHI.relayState.InsertRelay(target, 100, &Relay{Type: TerminalType, State: Requested, LocalIndex: 100, PeerAddr: target})
+	h, r = hm.QueryRelayReverseIndex(relayRemote, 0)
+	assert.Nil(t, h, "a zero index must not match a relay with no remote index")
+	assert.Nil(t, r)
+
+	// Two relays on the same host, told apart by their remote index.
+	hm.Relays[101] = relayHI
+	relayHI.relayState.InsertRelay(otherTarget, 101, &Relay{Type: TerminalType, State: Established, LocalIndex: 101, RemoteIndex: 201, PeerAddr: otherTarget})
+	relayHI.relayState.CompleteRelayByIP(target, 200)
+
+	h, r = hm.QueryRelayReverseIndex(relayRemote, 200)
+	assert.Same(t, relayHI, h)
+	assert.Equal(t, uint32(100), r.LocalIndex)
+	assert.Equal(t, target, r.PeerAddr)
+
+	h, r = hm.QueryRelayReverseIndex(relayRemote, 201)
+	assert.Same(t, relayHI, h)
+	assert.Equal(t, uint32(101), r.LocalIndex)
+	assert.Equal(t, otherTarget, r.PeerAddr)
+
+	// A different host that happens to have a relay at the same remote index is not preferred, but
+	// the match is still returned so the caller's spoof guard can reject it.
+	otherRelayAddr := netip.MustParseAddr("0.0.0.8")
+	otherRelayRemote := netip.MustParseAddrPort("192.0.2.8:4242")
+	otherHI := &HostInfo{
+		vpnAddrs:     []netip.Addr{otherRelayAddr},
+		localIndexId: 2,
+		relayState: RelayState{
+			relayForByAddr: map[netip.Addr]*Relay{},
+			relayForByIdx:  map[uint32]*Relay{},
+		},
+	}
+	uo := otherRelayRemote
+	otherHI.remote.Store(&uo)
+	hm.unlockedAddHostInfo(otherHI, f)
+	hm.Relays[102] = otherHI
+	otherHI.relayState.InsertRelay(target, 102, &Relay{Type: TerminalType, State: Established, LocalIndex: 102, RemoteIndex: 202, PeerAddr: target})
+
+	h, r = hm.QueryRelayReverseIndex(relayRemote, 202)
+	assert.Same(t, otherHI, h, "only one relay claims index 202")
+	assert.Equal(t, uint32(102), r.LocalIndex)
+
+	// With two relays claiming the same index, the one at the recv error's address wins.
+	hm.Relays[103] = relayHI
+	relayHI.relayState.InsertRelay(netip.MustParseAddr("0.0.0.3"), 103, &Relay{Type: TerminalType, State: Established, LocalIndex: 103, RemoteIndex: 202, PeerAddr: netip.MustParseAddr("0.0.0.3")})
+	h, r = hm.QueryRelayReverseIndex(relayRemote, 202)
+	assert.Same(t, relayHI, h, "the relay host the recv error came from must win")
+	assert.Equal(t, uint32(103), r.LocalIndex)
+}
+
 // TestHostMap_DeleteHostInfo_MultipleVpnAddrs exercises the case where a hostinfo carries more than one
 // vpnAddr and shares its next/prev chain with a live sibling. Deleting the head must not corrupt the
 // sibling: every address the sibling owns has to keep pointing at it. The pre-fix code unlinked the shared

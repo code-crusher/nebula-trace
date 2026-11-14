@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `recv_error` for a packet sent over a relay carries the relay index, but the sender only looked
+  that index up among its direct peers, so the error was dropped and the relay kept being used. The
+  relay is now found and marked `Disestablished` so the next handshake attempt rebuilds it. (#1458)
+
 ## [1.12.0] - 2026-10-29
 
 This release introduces udp/tun offloading support that can be enabled for greater performance. This will be enabled by default in a future release. See the `listen.udp_offloads` and `tun.use_offloads` example config settings for more details.
