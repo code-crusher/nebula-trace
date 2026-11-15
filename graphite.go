@@ -38,7 +38,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rcrowley/go-metrics"
+	"github.com/slackhq/nebula/internal/metrics"
 )
 
 // graphiteConfigExport provides a container with configuration parameters for
@@ -87,42 +87,39 @@ func graphiteOnce(ctx context.Context, c graphiteConfigExport, timeout time.Dura
 		case metrics.GaugeFloat64:
 			fmt.Fprintf(w, "%s.%s.value %f %d\n", c.Prefix, name, metric.Value(), now)
 		case metrics.Histogram:
-			h := metric.Snapshot()
-			ps := h.Percentiles(c.Percentiles)
-			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, h.Count(), now)
-			fmt.Fprintf(w, "%s.%s.min %d %d\n", c.Prefix, name, h.Min(), now)
-			fmt.Fprintf(w, "%s.%s.max %d %d\n", c.Prefix, name, h.Max(), now)
-			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, h.Mean(), now)
-			fmt.Fprintf(w, "%s.%s.std-dev %.2f %d\n", c.Prefix, name, h.StdDev(), now)
+			ps := metric.Percentiles(c.Percentiles)
+			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, metric.Count(), now)
+			fmt.Fprintf(w, "%s.%s.min %d %d\n", c.Prefix, name, metric.Min(), now)
+			fmt.Fprintf(w, "%s.%s.max %d %d\n", c.Prefix, name, metric.Max(), now)
+			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, metric.Mean(), now)
+			fmt.Fprintf(w, "%s.%s.std-dev %.2f %d\n", c.Prefix, name, metric.StdDev(), now)
 			for psIdx, psKey := range c.Percentiles {
 				key := strings.Replace(strconv.FormatFloat(psKey*100.0, 'f', -1, 64), ".", "", 1)
 				fmt.Fprintf(w, "%s.%s.%s-percentile %.2f %d\n", c.Prefix, name, key, ps[psIdx], now)
 			}
 		case metrics.Meter:
-			m := metric.Snapshot()
-			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, m.Count(), now)
-			fmt.Fprintf(w, "%s.%s.one-minute %.2f %d\n", c.Prefix, name, m.Rate1(), now)
-			fmt.Fprintf(w, "%s.%s.five-minute %.2f %d\n", c.Prefix, name, m.Rate5(), now)
-			fmt.Fprintf(w, "%s.%s.fifteen-minute %.2f %d\n", c.Prefix, name, m.Rate15(), now)
-			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, m.RateMean(), now)
+			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, metric.Count(), now)
+			fmt.Fprintf(w, "%s.%s.one-minute %.2f %d\n", c.Prefix, name, metric.Rate1(), now)
+			fmt.Fprintf(w, "%s.%s.five-minute %.2f %d\n", c.Prefix, name, metric.Rate5(), now)
+			fmt.Fprintf(w, "%s.%s.fifteen-minute %.2f %d\n", c.Prefix, name, metric.Rate15(), now)
+			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, metric.RateMean(), now)
 		case metrics.Timer:
-			t := metric.Snapshot()
-			ps := t.Percentiles(c.Percentiles)
-			count := t.Count()
+			ps := metric.Percentiles(c.Percentiles)
+			count := metric.Count()
 			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, count, now)
 			fmt.Fprintf(w, "%s.%s.count_ps %.2f %d\n", c.Prefix, name, float64(count)/flushSeconds, now)
-			fmt.Fprintf(w, "%s.%s.min %d %d\n", c.Prefix, name, t.Min()/int64(du), now)
-			fmt.Fprintf(w, "%s.%s.max %d %d\n", c.Prefix, name, t.Max()/int64(du), now)
-			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, t.Mean()/du, now)
-			fmt.Fprintf(w, "%s.%s.std-dev %.2f %d\n", c.Prefix, name, t.StdDev()/du, now)
+			fmt.Fprintf(w, "%s.%s.min %d %d\n", c.Prefix, name, metric.Min()/int64(du), now)
+			fmt.Fprintf(w, "%s.%s.max %d %d\n", c.Prefix, name, metric.Max()/int64(du), now)
+			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, metric.Mean()/du, now)
+			fmt.Fprintf(w, "%s.%s.std-dev %.2f %d\n", c.Prefix, name, metric.StdDev()/du, now)
 			for psIdx, psKey := range c.Percentiles {
 				key := strings.Replace(strconv.FormatFloat(psKey*100.0, 'f', -1, 64), ".", "", 1)
 				fmt.Fprintf(w, "%s.%s.%s-percentile %.2f %d\n", c.Prefix, name, key, ps[psIdx]/du, now)
 			}
-			fmt.Fprintf(w, "%s.%s.one-minute %.2f %d\n", c.Prefix, name, t.Rate1(), now)
-			fmt.Fprintf(w, "%s.%s.five-minute %.2f %d\n", c.Prefix, name, t.Rate5(), now)
-			fmt.Fprintf(w, "%s.%s.fifteen-minute %.2f %d\n", c.Prefix, name, t.Rate15(), now)
-			fmt.Fprintf(w, "%s.%s.mean-rate %.2f %d\n", c.Prefix, name, t.RateMean(), now)
+			fmt.Fprintf(w, "%s.%s.one-minute %.2f %d\n", c.Prefix, name, metric.Rate1(), now)
+			fmt.Fprintf(w, "%s.%s.five-minute %.2f %d\n", c.Prefix, name, metric.Rate5(), now)
+			fmt.Fprintf(w, "%s.%s.fifteen-minute %.2f %d\n", c.Prefix, name, metric.Rate15(), now)
+			fmt.Fprintf(w, "%s.%s.mean-rate %.2f %d\n", c.Prefix, name, metric.RateMean(), now)
 		}
 	})
 	// A failed write sticks, so this reports the first one

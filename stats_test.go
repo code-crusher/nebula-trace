@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rcrowley/go-metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/internal/metrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -672,4 +674,67 @@ func TestStatsServer_Start_duringStopWaitsForThePass(t *testing.T) {
 	}
 	waitFor(t, func() bool { return len(entered) == 1 })
 	assert.Equal(t, int64(1), most.Load(), "a Start captured alongside the pass Stop was waiting out")
+}
+
+// The prometheus bridge exports a histogram as one labeled gauge vector, the
+// same shape nbrownus/go-metrics-prometheus produced, so dashboards keep
+// working after the move off the archived libraries (issue #1590).
+func TestStatsServer_prometheusExportsHistogramsAsLabeledGauges(t *testing.T) {
+	defer metrics.DefaultRegistry.Unregister("handshake.duration.test")
+
+	l := slog.New(slog.DiscardHandler)
+	c := config.NewC(l)
+	setStatsConfig(c, map[string]any{
+		"type":     "prometheus",
+		"interval": "1s",
+		"listen":   "127.0.0.1:0",
+		"path":     "/metrics",
+	})
+	h := metrics.GetOrRegisterHistogram("handshake.duration.test", nil, metrics.NewExpDecaySample(1028, 0.015))
+	for i := int64(1); i <= 10; i++ {
+		h.Update(i)
+	}
+	s, err := newStatsServerFromConfig(t.Context(), l, c, "", false, nil)
+	require.NoError(t, err)
+
+	s.runMu.Lock()
+	fns, srv := s.buildRuntime(t.Context(), *s.runCfg)
+	s.runMu.Unlock()
+	require.NotNil(t, srv)
+	for _, fn := range fns {
+		fn()
+	}
+
+	rec := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	assert.Contains(t, body, `handshake_duration_test{type="count"} 10`)
+	assert.Contains(t, body, `handshake_duration_test{type="min"} 1`)
+	assert.Contains(t, body, `handshake_duration_test{type="max"} 10`)
+	assert.Contains(t, body, `handshake_duration_test{type="mean"} 5.5`)
+}
+
+// The capture timers (runtime.ReadMemStats, debug.ReadGCStats) export through
+// the same labeled-gauge shape as before, rates included. This drives the
+// provider directly with a private registry: the capture registrations are
+// guarded by a process-global sync.Once, so what buildRuntime registers into
+// DefaultRegistry depends on which test ran first.
+func TestStatsServer_prometheusExportsTimersWithRates(t *testing.T) {
+	r := metrics.NewRegistry()
+	metrics.RegisterRuntimeMemStats(r)
+	metrics.RegisterDebugGCStats(r)
+	metrics.CaptureRuntimeMemStatsOnce(r)
+	metrics.CaptureDebugGCStatsOnce(r)
+
+	pr := prometheus.NewRegistry()
+	p := newPrometheusProvider(r, "", "", pr, time.Second)
+	require.NoError(t, p.UpdatePrometheusMetricsOnce())
+
+	rec := httptest.NewRecorder()
+	promhttp.HandlerFor(pr, promhttp.HandlerOpts{}).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	assert.Contains(t, body, `runtime_ReadMemStats{type="count"}`)
+	assert.Contains(t, body, `runtime_ReadMemStats{type="rate_mean"}`)
+	assert.Contains(t, body, `debug_ReadGCStats{type="count"}`)
+	assert.Contains(t, body, `debug_ReadGCStats{type="rate_mean"}`)
 }

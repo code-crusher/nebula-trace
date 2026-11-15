@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/internal/metrics"
 	"golang.org/x/sys/unix"
 )
 

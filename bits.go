@@ -7,7 +7,7 @@ import (
 	"math"
 	mathbits "math/bits"
 
-	"github.com/rcrowley/go-metrics"
+	"github.com/slackhq/nebula/internal/metrics"
 )
 
 const bitsPerWord = 64

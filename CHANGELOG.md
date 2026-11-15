@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Drop the dependencies on `github.com/rcrowley/go-metrics`, archived April 2025, and
+  `github.com/nbrownus/go-metrics-prometheus`, unmaintained since 2021, by inlining the pieces Nebula uses
+  into a new internal package. Metric names and export formats are unchanged, so existing dashboards keep
+  working. (#1590)
+
 ## [1.12.0] - 2026-10-29
 
 This release introduces udp/tun offloading support that can be enabled for greater performance. This will be enabled by default in a future release. See the `listen.udp_offloads` and `tun.use_offloads` example config settings for more details.

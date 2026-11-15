@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/handshake"
 	"github.com/slackhq/nebula/header"
+	"github.com/slackhq/nebula/internal/metrics"
 	"github.com/slackhq/nebula/udp"
 )
 

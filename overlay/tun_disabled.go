@@ -8,7 +8,7 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/rcrowley/go-metrics"
+	"github.com/slackhq/nebula/internal/metrics"
 	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/overlay/tio"
 	"github.com/slackhq/nebula/routing"

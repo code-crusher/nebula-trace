@@ -14,11 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	mp "github.com/nbrownus/go-metrics-prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/internal/metrics"
 )
 
 // statsServer owns nebula's stats subsystem: the periodic metric capture
@@ -258,8 +257,8 @@ func (s *statsServer) Stop() {
 // http.Server from cfg. cfg has already been validated by loadStatsConfig.
 // A graphite send in progress is abandoned when ctx is done.
 func (s *statsServer) buildRuntime(ctx context.Context, cfg statsConfig) ([]func(), *http.Server) {
-	// rcrowley/go-metrics guards these registrations with a private sync.Once,
-	// so subsequent reloads are no-ops.
+	// The metric objects are constructed once per process; registering them
+	// again on a reload just discards the duplicates.
 	metrics.RegisterDebugGCStats(metrics.DefaultRegistry)
 	metrics.RegisterRuntimeMemStats(metrics.DefaultRegistry)
 
@@ -298,7 +297,7 @@ func (s *statsServer) buildRuntime(ctx context.Context, cfg statsConfig) ([]func
 
 	case "prometheus":
 		pr := prometheus.NewRegistry()
-		pClient := mp.NewPrometheusProvider(metrics.DefaultRegistry, cfg.prom.namespace, cfg.prom.subsystem, pr, cfg.interval)
+		pClient := newPrometheusProvider(metrics.DefaultRegistry, cfg.prom.namespace, cfg.prom.subsystem, pr, cfg.interval)
 		captureFns = append(captureFns, func() {
 			if err := pClient.UpdatePrometheusMetricsOnce(); err != nil {
 				s.l.Error("Prometheus metrics update failed", "error", err)

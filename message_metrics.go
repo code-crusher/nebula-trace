@@ -3,8 +3,8 @@ package nebula
 import (
 	"fmt"
 
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/header"
+	"github.com/slackhq/nebula/internal/metrics"
 )
 
 type MessageMetrics struct {

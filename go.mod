@@ -16,9 +16,7 @@ require (
 	github.com/kardianos/service v1.3.0
 	github.com/miekg/dns v1.1.73
 	github.com/miekg/pkcs11 v1.1.2
-	github.com/nbrownus/go-metrics-prometheus v0.0.0-20210712211119-974a6260965f
 	github.com/prometheus/client_golang v1.25.0
-	github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/stefanberger/go-pkcs11uri v0.0.0-20230803200340-78284954bff6
 	github.com/stretchr/testify v1.12.1

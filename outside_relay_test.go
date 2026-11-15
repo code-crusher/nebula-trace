@@ -8,8 +8,8 @@ import (
 
 	"github.com/flynn/noise"
 	"github.com/gaissmai/bart"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/header"
+	"github.com/slackhq/nebula/internal/metrics"
 	"github.com/slackhq/nebula/noiseutil"
 	"github.com/slackhq/nebula/overlay/batch"
 	"github.com/slackhq/nebula/test"

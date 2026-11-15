@@ -8,11 +8,11 @@ import (
 	"time"
 
 	"github.com/flynn/noise"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	ct "github.com/slackhq/nebula/cert_test"
 	"github.com/slackhq/nebula/handshake"
 	"github.com/slackhq/nebula/header"
+	"github.com/slackhq/nebula/internal/metrics"
 	"github.com/slackhq/nebula/overlay"
 	"github.com/slackhq/nebula/test"
 	"github.com/slackhq/nebula/udp"

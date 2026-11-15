@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rcrowley/go-metrics"
+	"github.com/slackhq/nebula/internal/metrics"
 	"github.com/slackhq/nebula/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

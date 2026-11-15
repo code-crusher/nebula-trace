@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/gaissmai/bart"
-	"github.com/rcrowley/go-metrics"
+	"github.com/slackhq/nebula/internal/metrics"
 	"github.com/slackhq/nebula/util"
 
 	"github.com/slackhq/nebula/cert"

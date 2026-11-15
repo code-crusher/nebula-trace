@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/internal/metrics"
 	"github.com/slackhq/nebula/overlay/overlaytest"
 	"github.com/slackhq/nebula/test"
 	"github.com/slackhq/nebula/udp"
