@@ -31,7 +31,9 @@ type sshdReloadHarness struct {
 	signer  ssh.Signer
 	listen  string
 	users   []string
-	extra   string
+	// usersYAML replaces the authorized_users entries generated from users when set
+	usersYAML string
+	extra     string
 }
 
 func newSSHDReloadHarness(t *testing.T) *sshdReloadHarness {
@@ -77,9 +79,11 @@ func (h *sshdReloadHarness) writeHostKey(t *testing.T, key crypto.Signer) ssh.Pu
 }
 
 func (h *sshdReloadHarness) config() string {
-	users := ""
-	for _, u := range h.users {
-		users += fmt.Sprintf("    - user: %s\n      keys: [%q]\n", u, string(ssh.MarshalAuthorizedKey(h.signer.PublicKey())))
+	users := h.usersYAML
+	if users == "" {
+		for _, u := range h.users {
+			users += fmt.Sprintf("    - user: %s\n      keys: [%q]\n", u, string(ssh.MarshalAuthorizedKey(h.signer.PublicKey())))
+		}
 	}
 	return fmt.Sprintf("sshd:\n  enabled: true\n  listen: %s\n  host_key: %s\n  authorized_users:\n%s%s",
 		h.listen, h.keyFile, users, h.extra)
@@ -219,6 +223,61 @@ func TestSSHDReload_BadHostKeyFileStops(t *testing.T) {
 	require.Eventually(t, func() bool { return !h.server.Running() }, 5*time.Second, 10*time.Millisecond)
 }
 
+// An authorized_users keys entry may name a file in the authorized_keys format, which is read for every key in it.
+func TestSSHDReload_AuthorizedKeysFile(t *testing.T) {
+	h := newSSHDReloadHarness(t)
+	keyFile := filepath.Join(t.TempDir(), "authorized_keys")
+	require.NoError(t, os.WriteFile(keyFile, []byte(fmt.Sprintf(
+		"# a comment\n\n%s\n", ssh.MarshalAuthorizedKey(h.signer.PublicKey()),
+	)), 0o600))
+	h.usersYAML = fmt.Sprintf("    - user: test\n      keys: [%q]\n", keyFile)
+	require.NoError(t, h.c.ReloadConfigString(h.config()).Err)
+
+	h.connect(t)
+}
+
+// A key file is re-read on a reload that doesn't change the config, so a key added to it works without a restart. A
+// key removed from it stops working, and the session already open is left alone.
+func TestSSHDReload_AuthorizedKeysFileChanged(t *testing.T) {
+	h := newSSHDReloadHarness(t)
+	keyFile := filepath.Join(t.TempDir(), "authorized_keys")
+	writeKeys := func(signers ...ssh.Signer) {
+		var b strings.Builder
+		for _, s := range signers {
+			b.Write(ssh.MarshalAuthorizedKey(s.PublicKey()))
+		}
+		require.NoError(t, os.WriteFile(keyFile, []byte(b.String()), 0o600))
+	}
+	writeKeys(h.signer)
+	h.usersYAML = fmt.Sprintf("    - user: test\n      keys: [%q]\n", keyFile)
+	require.NoError(t, h.c.ReloadConfigString(h.config()).Err)
+	client, _ := h.connect(t)
+
+	// A key added to the file is accepted without a restart
+	_, otherKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	otherSigner, err := ssh.NewSignerFromKey(otherKey)
+	require.NoError(t, err)
+	writeKeys(h.signer, otherSigner)
+	require.NoError(t, h.c.ReloadConfigString(h.config()).Err)
+
+	otherClient, err := ssh.Dial("tcp", h.server.Addr().String(), &ssh.ClientConfig{
+		User:            "test",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(otherSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         time.Second,
+	})
+	require.NoError(t, err)
+	_ = otherClient.Close()
+	assert.False(t, dropped(client, 500*time.Millisecond), "a changed authorized_keys file restarted sshd")
+
+	// A key removed from the file is refused on the next connection
+	writeKeys(otherSigner)
+	require.NoError(t, h.c.ReloadConfigString(h.config()).Err)
+	_, _, err = h.dial()
+	assert.Error(t, err, "a key removed from the file was still accepted")
+}
+
 // A trusted CA or authorized user that is skipped with a warning fails the reload, the valid ones are still used
 func TestSSHDReload_SkippedEntriesFail(t *testing.T) {
 	cases := map[string]string{
@@ -229,6 +288,7 @@ func TestSSHDReload_SkippedEntriesFail(t *testing.T) {
 		"key in a list not a string": "    - user: other\n      keys: [5]\n",
 		"bad key in a list":          "    - user: other\n      keys: [nope]\n",
 		"keys missing":               "    - user: other\n",
+		"missing key file":           "    - user: other\n      keys: [/does/not/exist]\n",
 	}
 	for name, extra := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -241,6 +301,22 @@ func TestSSHDReload_SkippedEntriesFail(t *testing.T) {
 			h.connect(t)
 		})
 	}
+}
+
+// A key file with nothing but comments and blank lines authorizes nobody, which is an error rather than a silent no-op
+func TestSSHDReload_AuthorizedKeysFileWithoutKeys(t *testing.T) {
+	h := newSSHDReloadHarness(t)
+	keyFile := filepath.Join(t.TempDir(), "authorized_keys")
+	require.NoError(t, os.WriteFile(keyFile, []byte("# nobody\n\n"), 0o600))
+	// The test user keeps its inline key, so the server still comes up and the empty file only fails the reload
+	h.usersYAML = fmt.Sprintf("    - user: test\n      keys: [%q]\n    - user: other\n      keys: [%q]\n",
+		string(ssh.MarshalAuthorizedKey(h.signer.PublicKey())), keyFile)
+
+	res := h.c.ReloadConfigString(h.config())
+	require.NoError(t, res.Err)
+	assert.True(t, res.Failed)
+	require.Eventually(t, h.server.Running, 5*time.Second, 10*time.Millisecond)
+	h.connect(t)
 }
 
 // TestSSHExecExitStatusReflectsTheCommand: an exec request exits 1 when the command

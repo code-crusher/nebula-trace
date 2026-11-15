@@ -228,9 +228,11 @@ punchy:
   # Authorized users and their public keys
   #authorized_users:
     #- user: steeeeve
-      # keys can be an array of strings or single string
+      # keys can be an array of strings or single string. An entry is either a public key or the path of a file in the
+      # authorized_keys format, which may hold any number of keys and is re-read on reload
       #keys:
         #- "ssh public key string"
+        #- /home/steeeeve/.ssh/authorized_keys
   # Trusted SSH CA public keys. These are the public keys of the CAs that are allowed to sign SSH keys for access.
   #trusted_cas:
     #- "ssh public key string"

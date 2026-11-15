@@ -1,14 +1,18 @@
 package nebula
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 )
 
 func TestReloadCommandReportsTheResult(t *testing.T) {
@@ -51,4 +55,51 @@ func TestReloadCommandReportsTheResult(t *testing.T) {
 	reason := reload(true)
 	assert.Contains(t, reason, "Config reload failed, the new config did not load")
 	assert.Contains(t, reason, dir, "names the config that did not load")
+}
+
+// An authorized_users keys entry is a key or the path of an authorized_keys file. The file may hold any number of keys
+// along with comments and blank lines, and a file with no keys in it is an error.
+func TestLoadSSHAuthorizedKeys(t *testing.T) {
+	key := func(t *testing.T) string {
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		signer, err := ssh.NewSignerFromKey(priv)
+		require.NoError(t, err)
+		return string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+	}
+	one, two := key(t), key(t)
+
+	write := func(t *testing.T, body string) string {
+		path := filepath.Join(t.TempDir(), "authorized_keys")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+		return path
+	}
+
+	t.Run("an inline key is returned as is", func(t *testing.T) {
+		got, err := loadSSHAuthorizedKeys(one)
+		require.NoError(t, err)
+		assert.Equal(t, []string{strings.TrimSpace(one)}, got)
+	})
+
+	t.Run("every key in a file is returned, comments and blank lines skipped", func(t *testing.T) {
+		path := write(t, "# a comment\n\n"+one+"\n   "+two+"   \n")
+		got, err := loadSSHAuthorizedKeys(path)
+		require.NoError(t, err)
+		assert.Equal(t, []string{strings.TrimSpace(one), strings.TrimSpace(two)}, got)
+	})
+
+	t.Run("a file without a key is an error", func(t *testing.T) {
+		_, err := loadSSHAuthorizedKeys(write(t, "# only a comment\n\n"))
+		assert.Error(t, err)
+	})
+
+	t.Run("a missing file is an error", func(t *testing.T) {
+		_, err := loadSSHAuthorizedKeys(filepath.Join(t.TempDir(), "nope"))
+		assert.Error(t, err)
+	})
+
+	t.Run("a file with a bad key is an error", func(t *testing.T) {
+		_, err := loadSSHAuthorizedKeys(write(t, one+"\nnot a key\n"))
+		assert.Error(t, err)
+	})
 }
