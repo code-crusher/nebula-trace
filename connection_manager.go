@@ -26,6 +26,7 @@ const (
 	migrateRelays  trafficDecision = 4
 	tryRehandshake trafficDecision = 5
 	sendTestPacket trafficDecision = 6
+	clearRemote    trafficDecision = 7
 )
 
 type connectionManager struct {
@@ -43,6 +44,11 @@ type connectionManager struct {
 	pendingDeletionInterval time.Duration
 	inactivityTimeout       atomic.Int64
 	dropInactive            atomic.Bool
+
+	// remoteFallbackAfter is the number of consecutive connection-manager ticks with outbound traffic and no
+	// direct inbound traffic that must pass before a primary tunnel's stale hostinfo.remote is cleared and the
+	// tunnel re-handshakes, falling back to relays for outbound traffic in the meantime (issue #1748).
+	remoteFallbackAfter int32
 
 	l *slog.Logger
 }
@@ -69,6 +75,9 @@ func (cm *connectionManager) reload(c *config.C, initial bool) {
 	if initial {
 		cm.checkInterval = time.Duration(c.GetInt("timers.connection_alive_interval", 5)) * time.Second
 		cm.pendingDeletionInterval = time.Duration(c.GetInt("timers.pending_deletion_interval", 10)) * time.Second
+		// After this many ticks with outbound traffic and no direct inbound traffic, a primary tunnel's stale
+		// direct remote is cleared and the tunnel re-handshakes (issue #1748).
+		cm.remoteFallbackAfter = int32(c.GetInt("timers.remote_fallback_after", 6))
 
 		// We want at least a minimum resolution of 500ms per tick so that we can hit these intervals
 		// pretty close to their configured duration.
@@ -109,6 +118,12 @@ func (cm *connectionManager) In(h *HostInfo) {
 	h.markIn()
 }
 
+// InDirect records inbound traffic that was received directly (not via a relay). It implies In; direct inbound
+// traffic is what proves the cached remote is healthy for outbound traffic too (issue #1748).
+func (cm *connectionManager) InDirect(h *HostInfo) {
+	h.markInDirect()
+}
+
 // OutNoRebind records outbound traffic without consuming the rebind epoch, for relayed sends: the direct path
 // to the relay consumes the edge, the via send must not.
 func (cm *connectionManager) OutNoRebind(h *HostInfo) {
@@ -134,13 +149,14 @@ func (cm *connectionManager) RelayUsed(localIndex uint32) {
 }
 
 // getAndResetTrafficCheck returns if there was any inbound or outbound traffic within the last tick and
-// resets the state for this local index
-func (cm *connectionManager) getAndResetTrafficCheck(h *HostInfo, now time.Time) (bool, bool) {
-	in, out := h.takeTraffic()
+// resets the state for this local index. inDirect reports whether any of that inbound traffic was received
+// directly (not via a relay).
+func (cm *connectionManager) getAndResetTrafficCheck(h *HostInfo, now time.Time) (in bool, inDirect bool, out bool) {
+	in, inDirect, out = h.takeTraffic()
 	if in || out {
 		h.lastUsed = now
 	}
-	return in, out
+	return in, inDirect, out
 }
 
 func (cm *connectionManager) Start(ctx context.Context) {
@@ -193,6 +209,9 @@ func (cm *connectionManager) doTrafficCheck(localIndex uint32, p, nb, out []byte
 
 	case sendTestPacket:
 		cm.intf.SendMessageToHostInfo(header.Test, header.TestRequest, hostinfo, p, nb, out)
+
+	case clearRemote:
+		cm.clearRemote(hostinfo)
 	}
 
 	cm.resetRelayTrafficCheck(hostinfo)
@@ -341,17 +360,43 @@ func (cm *connectionManager) makeTrafficDecision(localIndex uint32, now time.Tim
 	}
 
 	// Check for traffic on this hostinfo
-	inTraffic, outTraffic := cm.getAndResetTrafficCheck(hostinfo, now)
+	inTraffic, inDirectTraffic, outTraffic := cm.getAndResetTrafficCheck(hostinfo, now)
 
 	// A hostinfo is determined alive if there is incoming traffic
 	if inTraffic {
+		hostinfo.setPendingDeletion(false)
+
+		// Direct inbound traffic proves the cached remote is healthy for outbound traffic too, so the
+		// stale-remote counter restarts from scratch.
+		if inDirectTraffic {
+			hostinfo.remoteCheckCounter.Store(0)
+		}
+
+		// The tunnel is alive, but if the peer is only reachable via a relay we may be pinned to a stale direct
+		// underlay: outbound traffic keeps going to a dead hostinfo.remote while relay traffic keeps the tunnel
+		// alive. Once we have sent outbound traffic for a sustained window with no direct inbound reply, clear
+		// the stale remote so outbound falls back to the relay, and re-handshake so the peer can teach us a fresh
+		// direct address if one exists. (issue #1748)
+		if mainHostInfo && outTraffic && !inDirectTraffic && hostinfo.GetRemote().IsValid() {
+			ticks := hostinfo.remoteCheckCounter.Add(1)
+			if ticks >= cm.remoteFallbackAfter {
+				cm.l.Info("Tunnel is alive only via relay, clearing stale direct remote",
+					"vpnAddrs", hostinfo.vpnAddrs,
+					"udpAddr", hostinfo.GetRemote(),
+					"ticks", ticks,
+				)
+				hostinfo.remoteCheckCounter.Store(0)
+				cm.trafficTimer.Add(hostinfo.localIndexId, cm.checkInterval)
+				return clearRemote, hostinfo, primary
+			}
+		}
+
 		decision := doNothing
 		if cm.l.Enabled(context.Background(), slog.LevelDebug) {
 			hostinfo.logger(cm.l).Debug("Tunnel status",
 				"tunnelCheck", m{"state": "alive", "method": "passive"},
 			)
 		}
-		hostinfo.setPendingDeletion(false)
 
 		if mainHostInfo {
 			decision = tryRehandshake
@@ -373,6 +418,11 @@ func (cm *connectionManager) makeTrafficDecision(localIndex uint32, now time.Tim
 
 		return decision, hostinfo, primary
 	}
+
+	// This tunnel received no inbound traffic this tick; there is no inbound traffic to declare the remote healthy.
+	// Reset the direct-remote health counter so a peer that goes quiet while our outbound is one-way does not
+	// accumulate enough ticks to clear the remote based on stale evidence.
+	hostinfo.remoteCheckCounter.Store(0)
 
 	if hostinfo.isPendingDeletion() {
 		// We have already sent a test packet and nothing was returned, this hostinfo is dead
@@ -578,4 +628,28 @@ func (cm *connectionManager) tryRehandshake(hostinfo *HostInfo) {
 		cm.intf.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
 		return
 	}
+}
+
+// clearRemote drops the cached direct underlay of a tunnel that is only being kept alive by relay traffic and
+// re-handshakes, so the peer can re-learn a working direct address if one exists. While the rehandshake is in
+// flight sendNoMetrics sees no valid remote and falls back to the relay path, which is what resolves the
+// one-way blackhole. (issue #1748)
+func (cm *connectionManager) clearRemote(hostinfo *HostInfo) {
+	oldRemote := hostinfo.GetRemote()
+	if !oldRemote.IsValid() {
+		return
+	}
+
+	hostinfo.logger(cm.l).Info("Clearing stale direct remote, falling back to relay",
+		"udpAddr", oldRemote,
+	)
+	// Keep the old remote as lastRoamRemote so RoamingSuppressSeconds still guards a bad roam straight back to it.
+	hostinfo.lastRoam = time.Now()
+	hostinfo.lastRoamRemote = oldRemote
+	hostinfo.ClearRemote()
+
+	// Re-learn the peer's current direct underlay. QueryServer asks the lighthouse to send fresh remotes and the
+	// rehandshake establishes the tunnel via relay until the peer roams us back onto a working direct path.
+	cm.intf.lightHouse.QueryServer(hostinfo.vpnAddrs[0])
+	cm.intf.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
 }

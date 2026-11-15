@@ -250,6 +250,10 @@ type HostInfo struct {
 	localIndexId   uint32
 	remotes        *RemoteList
 
+	// remoteCheckCounter tracks consecutive connection-manager ticks with outbound traffic and no direct inbound
+	// traffic, used to decide when a tunnel kept alive only by relays has a stale direct remote (issue #1748).
+	remoteCheckCounter atomic.Int32
+
 	// vpnAddrs is a list of vpn addresses assigned to this host that are within our own vpn networks
 	// The host may have other vpn addresses that are outside our
 	// vpn networks but were removed because they are not usable
@@ -772,12 +776,13 @@ func (i *HostInfo) TryPromoteBest(preferredRanges []netip.Prefix, ifce *Interfac
 // Bits within HostInfo.state, everything above stateEpochShift is the epoch
 const (
 	stateIn uint32 = 1 << iota
+	stateInDirect
 	stateOut
 	statePendingDeletion
 
-	stateFlags = stateIn | stateOut | statePendingDeletion
+	stateFlags = stateIn | stateInDirect | stateOut | statePendingDeletion
 	// The epoch is the top 29 bits, it would take 2^29 rebinds to wrap and we will never get there
-	stateEpochShift = 3
+	stateEpochShift = 4
 )
 
 // markIn records inbound traffic
@@ -785,6 +790,13 @@ func (i *HostInfo) markIn() {
 	if i.state.Load()&stateIn == 0 {
 		i.state.Or(stateIn)
 	}
+}
+
+// markInDirect records inbound traffic that arrived directly, not via a relay.
+// It implies markIn: a direct packet is inbound traffic.
+func (i *HostInfo) markInDirect() {
+	i.markIn()
+	i.state.Or(stateInDirect)
 }
 
 // markOut records a send and reports whether the epoch moved, meaning we want a punch from the far side
@@ -809,10 +821,11 @@ func (i *HostInfo) markOutOnly() {
 	}
 }
 
-// takeTraffic clears both traffic bits, leaving the epoch alone, and reports what they were
-func (i *HostInfo) takeTraffic() (in bool, out bool) {
-	old := i.state.And(^(stateIn | stateOut))
-	return old&stateIn != 0, old&stateOut != 0
+// takeTraffic clears the traffic bits, leaving the epoch alone, and reports what they were.
+// inDirect reports inbound traffic that was received directly (not via a relay).
+func (i *HostInfo) takeTraffic() (in bool, inDirect bool, out bool) {
+	old := i.state.And(^(stateIn | stateInDirect | stateOut))
+	return old&stateIn != 0, old&stateInDirect != 0, old&stateOut != 0
 }
 
 func (i *HostInfo) setPendingDeletion(v bool) {
@@ -848,6 +861,13 @@ func (i *HostInfo) SetRemote(remote netip.AddrPort) {
 		i.remote.Store(&remote)
 		i.remotes.LearnRemote(i.vpnAddrs[0], remote)
 	}
+}
+
+// ClearRemote drops the cached direct underlay, leaving the tunnel to fall back to relays. Unlike SetRemote, it
+// does not write the zero address into the learned-remotes list, which is what keeps a stale direct address from
+// being re-learned. (issue #1748)
+func (i *HostInfo) ClearRemote() {
+	i.remote.Store(nil)
 }
 
 // SetRemoteIfPreferred returns true if the remote was changed. The lastRoam

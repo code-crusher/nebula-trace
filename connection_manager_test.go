@@ -17,6 +17,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// drainLightHouseQueries collects any lighthouse re-queries that have been queued but not yet processed.
+func drainLightHouseQueries(lh *LightHouse) []netip.Addr {
+	var queried []netip.Addr
+	for {
+		select {
+		case vpnAddr := <-lh.queryChan:
+			queried = append(queried, vpnAddr)
+		default:
+			return queried
+		}
+	}
+}
+
 func newTestLighthouse() *LightHouse {
 	lh := &LightHouse{
 		l:         test.NewLogger(),
@@ -462,6 +475,135 @@ func Test_NewConnectionManagerTest_DisconnectInvalid(t *testing.T) {
 	nextTick = now.Add(61 * time.Second)
 	invalid = nc.isInvalidCertificate(nextTick, hostinfo)
 	assert.True(t, invalid)
+}
+
+// newStaleRemoteFixture builds a connection manager, lighthouse, and a primary tunnel whose remote is set to a
+// direct underlay address. The peer is only reachable via a relay after that direct path dies (issue #1748).
+func newStaleRemoteFixture(t *testing.T, remoteFallbackAfter int) (*connectionManager, *LightHouse, *HostInfo) {
+	t.Helper()
+	l := test.NewLogger()
+	localrange := netip.MustParsePrefix("10.1.1.1/24")
+	vpnIp := netip.MustParseAddr("172.1.1.2")
+	preferredRanges := []netip.Prefix{localrange}
+
+	hostMap := newHostMap(l)
+	hostMap.preferredRanges.Store(&preferredRanges)
+
+	cs := &CertState{
+		initiatingVersion: cert.Version1,
+		privateKey:        []byte{},
+		v1Cert:            &dummyCert{version: cert.Version1},
+		v1Credential:      nil,
+	}
+
+	lh := newTestLighthouse()
+	ifce := &Interface{
+		hostMap:          hostMap,
+		inside:           &overlaytest.NoopTun{},
+		outside:          &udp.NoopConn{},
+		firewall:         &Firewall{},
+		lightHouse:       lh,
+		pki:              &PKI{},
+		handshakeManager: NewHandshakeManager(l, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
+		l:                l,
+	}
+	ifce.pki.cs.Store(cs)
+
+	conf := config.NewC(test.NewLogger())
+	if remoteFallbackAfter > 0 {
+		conf.Settings["timers"] = map[string]any{"remote_fallback_after": remoteFallbackAfter}
+	}
+	punchy := NewPunchyFromConfig(test.NewLogger(), conf, nil)
+	nc := newConnectionManagerFromConfig(test.NewLogger(), conf, hostMap, punchy)
+	nc.intf = ifce
+	ifce.connectionManager = nc
+
+	hostinfo := &HostInfo{
+		vpnAddrs:      []netip.Addr{vpnIp},
+		localIndexId:  1099,
+		remoteIndexId: 9901,
+	}
+	hostinfo.ConnectionState = &ConnectionState{
+		myCert: &dummyCert{version: cert.Version1},
+	}
+	hostinfo.remotes = lh.QueryCache([]netip.Addr{vpnIp})
+	hostinfo.SetRemote(netip.MustParseAddrPort("198.51.100.2:4242"))
+	nc.hostMap.unlockedAddHostInfo(hostinfo, ifce)
+
+	return nc, lh, hostinfo
+}
+
+// A primary tunnel pinned to a dead direct remote but kept alive by relay traffic must clear the stale remote and
+// re-handshake once enough ticks pass with outbound traffic and no direct inbound traffic, so outbound packets fall
+// back to the relay instead of being blackholed (issue #1748).
+func Test_NewConnectionManager_StaleRemoteFallsBackToRelay(t *testing.T) {
+	nc, lh, hostinfo := newStaleRemoteFixture(t, 0)
+
+	// Relay traffic keeps the tunnel alive: inbound arrives, but never directly. The counter accumulates across
+	// consecutive ticks; each makeTrafficDecision is one connection-manager tick.
+	fallbackAfter := int(nc.remoteFallbackAfter)
+	for i := 1; i < fallbackAfter; i++ {
+		nc.Out(hostinfo)
+		nc.In(hostinfo) // relayed inbound
+		decision, _, _ := nc.makeTrafficDecision(hostinfo.localIndexId, time.Now())
+		assert.Equal(t, tryRehandshake, decision, "the tunnel stays up but keeps trying to rehandshake")
+		assert.True(t, hostinfo.GetRemote().IsValid(), "the remote is only cleared once the threshold is reached")
+		assert.Equal(t, int32(i), hostinfo.remoteCheckCounter.Load(), "the counter tracks consecutive ticks")
+	}
+
+	// Drive the crossing tick through doTrafficCheck, which runs the clearRemote action: the stale remote is dropped,
+	// the lighthouse is re-queried, and a fresh handshake is started so outbound falls back to the relay until the
+	// peer teaches us a working direct address.
+	nc.Out(hostinfo)
+	nc.In(hostinfo)
+	nc.doTrafficCheck(hostinfo.localIndexId, []byte(""), make([]byte, 12, 12), make([]byte, mtu), time.Now())
+	assert.Zero(t, hostinfo.remoteCheckCounter.Load(), "the counter resets after the fallback fires")
+	assert.False(t, hostinfo.GetRemote().IsValid(), "the action cleared the stale remote")
+	assert.Equal(t, netip.MustParseAddrPort("198.51.100.2:4242"), hostinfo.lastRoamRemote, "the old remote is preserved for roam suppression")
+	assert.Contains(t, drainLightHouseQueries(lh), hostinfo.vpnAddrs[0], "the action re-queried the lighthouse")
+
+	// A direct packet re-pins the remote (as handleHostRoaming would) and proves the direct path healthy again:
+	// outbound with direct inbound traffic no longer clears anything.
+	hostinfo.SetRemote(netip.MustParseAddrPort("198.51.100.2:4242"))
+	nc.Out(hostinfo)
+	nc.InDirect(hostinfo)
+	decision, _, _ := nc.makeTrafficDecision(hostinfo.localIndexId, time.Now())
+	assert.Equal(t, tryRehandshake, decision, "a direct packet re-established the remote, the tunnel is healthy again")
+	assert.True(t, hostinfo.GetRemote().IsValid())
+}
+
+// A tunnel that receives a direct inbound packet resets the stale-remote counter: the direct path is healthy and
+// nothing should be cleared.
+func Test_NewConnectionManager_StaleRemoteDirectTrafficResets(t *testing.T) {
+	nc, lh, hostinfo := newStaleRemoteFixture(t, 0)
+
+	nc.Out(hostinfo)
+	nc.In(hostinfo)
+	nc.makeTrafficDecision(hostinfo.localIndexId, time.Now())
+	assert.Equal(t, int32(1), hostinfo.remoteCheckCounter.Load(), "a relay-only tick with outbound traffic increments the counter")
+
+	// A direct packet arrives; the counter resets and no clearing happens.
+	nc.Out(hostinfo)
+	nc.InDirect(hostinfo)
+	decision, _, _ := nc.makeTrafficDecision(hostinfo.localIndexId, time.Now())
+	assert.Equal(t, tryRehandshake, decision, "direct inbound traffic keeps the remote pinned")
+	assert.Zero(t, hostinfo.remoteCheckCounter.Load(), "a direct inbound packet resets the stale-remote counter")
+	assert.True(t, hostinfo.GetRemote().IsValid())
+	assert.Empty(t, drainLightHouseQueries(lh), "no lighthouse query is needed when the direct path is healthy")
+}
+
+// The stale-remote fallback is only armed when outbound traffic exists: a tunnel that only receives relay traffic
+// with nothing to send has no blackholed outbound path and must never clear its remote.
+func Test_NewConnectionManager_StaleRemoteRequiresOutboundTraffic(t *testing.T) {
+	nc, lh, hostinfo := newStaleRemoteFixture(t, 0)
+
+	for i := 0; i < int(nc.remoteFallbackAfter)+2; i++ {
+		nc.In(hostinfo) // relayed inbound only
+		decision, _, _ := nc.makeTrafficDecision(hostinfo.localIndexId, time.Now())
+		assert.Equal(t, tryRehandshake, decision)
+		assert.True(t, hostinfo.GetRemote().IsValid(), "no outbound traffic, the remote must stay pinned")
+	}
+	assert.Empty(t, drainLightHouseQueries(lh))
 }
 
 type dummyCert struct {

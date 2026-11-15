@@ -427,12 +427,31 @@ func TestHostInfo_markOut(t *testing.T) {
 	h.markIn()
 	assert.True(t, h.markOut(7))
 	assert.True(t, h.isPendingDeletion(), "pendingDeletion must survive an epoch change")
-	in, out := h.takeTraffic()
+	in, inDirect, out := h.takeTraffic()
 	assert.True(t, in, "inbound traffic must survive an epoch change")
+	assert.False(t, inDirect, "markIn is not direct inbound traffic")
 	assert.True(t, out)
 
 	// Clearing the traffic bits leaves the epoch alone, otherwise an idle tunnel would requery forever
 	assert.False(t, h.markOut(7), "takeTraffic must not disturb the epoch")
+}
+
+// markInDirect implies inbound traffic and is reported distinctly from relayed inbound traffic so the
+// connection manager can tell when a tunnel is only alive via a relay (issue #1748).
+func TestHostInfo_markInDirect(t *testing.T) {
+	h := &HostInfo{}
+
+	h.markInDirect()
+	in, inDirect, out := h.takeTraffic()
+	assert.True(t, in, "a direct packet is inbound traffic")
+	assert.True(t, inDirect, "the direct inbound bit must be reported")
+	assert.False(t, out)
+
+	// A relayed packet marks generic inbound traffic, not the direct bit.
+	h.markIn()
+	in, inDirect, _ = h.takeTraffic()
+	assert.True(t, in)
+	assert.False(t, inDirect, "relayed traffic must not set the direct inbound bit")
 }
 
 // A relayed send records traffic but must leave the rebind epoch for the direct path to consume, otherwise
@@ -447,6 +466,26 @@ func TestHostInfo_markOutOnly(t *testing.T) {
 
 	assert.True(t, h.markOut(6), "a relayed send must not consume the epoch edge")
 	assert.False(t, h.markOut(6))
+}
+
+// ClearRemote drops the cached direct underlay without polluting the learned-remotes list, so the stale address
+// is not re-learned from the lighthouse cache (issue #1748).
+func TestHostInfo_ClearRemote(t *testing.T) {
+	vpnAddr := netip.MustParseAddr("172.1.1.2")
+	h := &HostInfo{
+		vpnAddrs: []netip.Addr{vpnAddr},
+		remotes:  NewRemoteList([]netip.Addr{vpnAddr}, nil),
+	}
+	u := netip.MustParseAddrPort("198.51.100.2:4242")
+	h.SetRemote(u)
+	assert.Equal(t, u, h.GetRemote())
+	assert.Contains(t, h.remotes.CopyAddrs(nil), u, "SetRemote learns the direct address")
+
+	h.ClearRemote()
+	assert.False(t, h.GetRemote().IsValid(), "the cached direct underlay must be gone")
+	assert.NotContains(t, h.remotes.CopyAddrs(nil), netip.AddrPort{}, "ClearRemote must not write a zero address into the learned list")
+	// The stale address stays as a candidate for the future direct path; only the pinned remote is cleared.
+	assert.Contains(t, h.remotes.CopyAddrs(nil), u)
 }
 
 // A preferred range that doesn't parse is skipped and the rest are used, the reload says one was skipped

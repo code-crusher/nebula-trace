@@ -841,3 +841,39 @@ func Test_newPacket_parsedFields(t *testing.T) {
 	assert.True(t, p.Fragment)
 	assert.True(t, p.FragAny)
 }
+
+// recordInbound must distinguish a packet that physically arrived from the cached remote (direct-inbound, which
+// proves the direct path healthy) from one that arrived via a relay or from another address (generic inbound only).
+// The stale-remote fallback in the connection manager depends on this distinction (issue #1748).
+func Test_recordInbound(t *testing.T) {
+	cm := &connectionManager{}
+	f := &Interface{connectionManager: cm}
+
+	vpnAddr := netip.MustParseAddr("172.1.1.2")
+	remote := netip.MustParseAddrPort("198.51.100.2:4242")
+	h := &HostInfo{
+		vpnAddrs: []netip.Addr{vpnAddr},
+		remotes:  NewRemoteList([]netip.Addr{vpnAddr}, nil),
+	}
+	h.SetRemote(remote)
+
+	// A packet that arrived directly from the cached remote proves the direct path.
+	f.recordInbound(h, ViaSender{UdpAddr: remote})
+	in, inDirect, _ := h.takeTraffic()
+	assert.True(t, in)
+	assert.True(t, inDirect, "a direct packet from the cached remote is direct inbound")
+
+	// A packet that arrived via a relay is inbound traffic but must not claim the direct path is healthy.
+	f.recordInbound(h, ViaSender{UdpAddr: remote, IsRelayed: true})
+	in, inDirect, _ = h.takeTraffic()
+	assert.True(t, in)
+	assert.False(t, inDirect, "a relayed packet must not set the direct inbound bit")
+
+	// A packet that arrived directly but from a different address (e.g. while roam suppression is active) is not
+	// proof the cached remote works for outbound.
+	other := netip.MustParseAddrPort("198.51.100.9:4242")
+	f.recordInbound(h, ViaSender{UdpAddr: other})
+	in, inDirect, _ = h.takeTraffic()
+	assert.True(t, in)
+	assert.False(t, inDirect, "a direct packet from another address must not set the direct inbound bit")
+}

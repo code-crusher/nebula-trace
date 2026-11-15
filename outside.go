@@ -23,6 +23,19 @@ const (
 
 var ErrOutOfWindow = errors.New("out of window packet")
 
+// recordInbound records an authenticated inbound packet on the hostinfo's tunnel. When the packet physically
+// arrived from the exact address hostinfo.remote points at, the direct path is provably healthy for outbound
+// traffic too, so the traffic is recorded as direct-inbound; the connection manager uses that to keep a stale
+// remote from being cleared (issue #1748). Packets that arrived via a relay, or from a different address than the
+// cached remote (e.g. while roam suppression is active), only count as generic inbound traffic.
+func (f *Interface) recordInbound(hostinfo *HostInfo, via ViaSender) {
+	if !via.IsRelayed && hostinfo.GetRemote() == via.UdpAddr {
+		f.connectionManager.InDirect(hostinfo)
+	} else {
+		f.connectionManager.In(hostinfo)
+	}
+}
+
 // readOutsidePackets processes one received underlay packet.
 // Message payloads are decrypted IN PLACE, so packet must stay untouched
 // by the caller until the TUN and relay batches for queue q have been flushed.
@@ -139,7 +152,7 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 
 	// Roam before we respond
 	f.handleHostRoaming(hostinfo, via)
-	f.connectionManager.In(hostinfo)
+	f.recordInbound(hostinfo, via)
 
 	switch h.Type {
 	case header.Message:
@@ -191,8 +204,7 @@ func (f *Interface) handleOutsideRelayPacket(hostinfo *HostInfo, via ViaSender, 
 	signedPayload := packet[header.Len : len(packet)-hostinfo.ConnectionState.dKey.Overhead()]
 	// Pull the Roaming parts up here, and return in all call paths.
 	f.handleHostRoaming(hostinfo, via)
-	// Track usage of both the HostInfo and the Relay for the received & authenticated packet
-	f.connectionManager.In(hostinfo)
+	// Track usage of the Relay for the received & authenticated packet.
 	f.connectionManager.RelayUsed(h.RemoteIndex)
 
 	relay, ok := hostinfo.relayState.QueryRelayForByIdx(h.RemoteIndex)
@@ -202,6 +214,11 @@ func (f *Interface) handleOutsideRelayPacket(hostinfo *HostInfo, via ViaSender, 
 		hostinfo.logger(f.l).Error("HostInfo missing remote relay index", "relayRemoteIndex", h.RemoteIndex)
 		return
 	}
+
+	// A packet that reached us proves the relay tunnel's direct path is healthy for outbound traffic too, which
+	// is what keeps the connection manager from clearing a stale remote (issue #1748). Whether it counts as direct
+	// depends on the physical arrival path, exactly as in readOutsidePackets.
+	f.recordInbound(hostinfo, via)
 
 	switch relay.Type {
 	case TerminalType:
