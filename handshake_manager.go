@@ -897,7 +897,7 @@ func (hm *HandshakeManager) beginHandshake(via ViaSender, packet []byte, h *head
 	}
 
 	hm.sendHandshakeResponse(via, response, hostinfo, false)
-	hostinfo.remotes.RefreshFromHandshake(vpnAddrs)
+	hostinfo.remotes.RefreshFromHandshake(vpnAddrs, remoteCert.Certificate.Version())
 
 	// Don't wait for UpdateWorker
 	if f.lightHouse.IsAnyLighthouseAddr(vpnAddrs) {
@@ -1089,7 +1089,7 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 		f.cachedPacketMetrics.sent.Inc(int64(len(hh.packetStore)))
 	}
 
-	hostinfo.remotes.RefreshFromHandshake(vpnAddrs)
+	hostinfo.remotes.RefreshFromHandshake(vpnAddrs, remoteCert.Certificate.Version())
 	f.metricHandshakes.Update(duration)
 
 	// Don't wait for UpdateWorker
