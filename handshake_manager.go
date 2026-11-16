@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rcrowley/go-metrics"
@@ -65,7 +66,7 @@ type HandshakeManager struct {
 	lightHouse                *LightHouse
 	outside                   udp.Conn
 	config                    HandshakeConfig
-	OutboundHandshakeTimer    *LockingTimerWheel[netip.Addr]
+	OutboundHandshakeTimer    *LockingTimerWheel[*HandshakeHostInfo]
 	messageMetrics            *MessageMetrics
 	metricInitiated           metrics.Counter
 	metricTimedOut            metrics.Counter
@@ -83,6 +84,7 @@ type HandshakeHostInfo struct {
 
 	startTime                 time.Time        // Time that we first started trying with this handshake
 	ready                     bool             // Is the handshake ready
+	deleted                   atomic.Bool      // Has the handshake been removed from the pending maps
 	initiatingVersionOverride cert.Version     // Should we use a non-default cert version for this handshake?
 	counter                   int64            // How many attempts have we made so far
 	lastRemotes               []netip.AddrPort // Remotes that we sent to during the previous attempt
@@ -207,7 +209,7 @@ func NewHandshakeManager(l *slog.Logger, mainHostMap *HostMap, lightHouse *Light
 		outside:                   outside,
 		config:                    config,
 		trigger:                   make(chan netip.Addr, config.triggerBuffer),
-		OutboundHandshakeTimer:    NewLockingTimerWheel[netip.Addr](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
+		OutboundHandshakeTimer:    NewLockingTimerWheel[*HandshakeHostInfo](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
 		messageMetrics:            config.messageMetrics,
 		metricInitiated:           metrics.GetOrRegisterCounter("handshake_manager.initiated", nil),
 		metricTimedOut:            metrics.GetOrRegisterCounter("handshake_manager.timed_out", nil),
@@ -226,7 +228,9 @@ func (hm *HandshakeManager) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case vpnIP := <-hm.trigger:
-			hm.handleOutbound(vpnIP, true)
+			if hh := hm.queryVpnIp(vpnIP); hh != nil {
+				hm.handleOutbound(hh, true)
+			}
 		case now := <-clockSource.C:
 			hm.NextOutboundHandshakeTimerTick(now)
 		}
@@ -281,23 +285,26 @@ func (hm *HandshakeManager) HandleIncoming(via ViaSender, packet []byte, h *head
 func (hm *HandshakeManager) NextOutboundHandshakeTimerTick(now time.Time) {
 	hm.OutboundHandshakeTimer.Advance(now)
 	for {
-		vpnIp, has := hm.OutboundHandshakeTimer.Purge()
+		hh, has := hm.OutboundHandshakeTimer.Purge()
 		if !has {
 			break
 		}
-		hm.handleOutbound(vpnIp, false)
+		hm.handleOutbound(hh, false)
 	}
 }
 
-func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered bool) {
-	hh := hm.queryVpnIp(vpnIp)
-	if hh == nil {
-		return
-	}
+func (hm *HandshakeManager) handleOutbound(hh *HandshakeHostInfo, lighthouseTriggered bool) {
 	hh.Lock()
 	defer hh.Unlock()
 
+	// Timer entries outlive the handshake that scheduled them. A new handshake for the same vpn addr runs its own
+	// timer chain, so an entry left behind by a deleted handshake must not drive it.
+	if hh.deleted.Load() {
+		return
+	}
+
 	hostinfo := hh.hostinfo
+	vpnIp := hostinfo.vpnAddrs[0]
 	// If we are out of time, clean up
 	if hh.counter >= hm.config.retries {
 		fields := []any{
@@ -324,10 +331,14 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 	// Increment the counter to increase our delay, linear backoff
 	hh.counter++
 
+	// A lighthouse triggered attempt is still in the timer wheel, adding it again would start a second retry chain
+	if !lighthouseTriggered {
+		defer hm.OutboundHandshakeTimer.Add(hh, hm.config.tryInterval*time.Duration(hh.counter))
+	}
+
 	// Check if we have a handshake packet to transmit yet
 	if !hh.ready {
 		if !hm.buildStage0Packet(hh) {
-			hm.OutboundHandshakeTimer.Add(vpnIp, hm.config.tryInterval*time.Duration(hh.counter))
 			return
 		}
 	}
@@ -408,11 +419,6 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 	}
 
 	hm.f.relayManager.StartRelays(hm.f, vpnIp, hh, stage0)
-
-	// If a lighthouse triggered this attempt then we are still in the timer wheel and do not need to re-add
-	if !lighthouseTriggered {
-		hm.OutboundHandshakeTimer.Add(vpnIp, hm.config.tryInterval*time.Duration(hh.counter))
-	}
 }
 
 // GetOrHandshake will try to find a hostinfo with a fully formed tunnel or start a new handshake if one is not present
@@ -465,7 +471,7 @@ func (hm *HandshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*Han
 	}
 	hm.vpnIps[vpnAddr] = hh
 	hm.metricInitiated.Inc(1)
-	hm.OutboundHandshakeTimer.Add(vpnAddr, hm.config.tryInterval)
+	hm.OutboundHandshakeTimer.Add(hh, hm.config.tryInterval)
 
 	if cacheCb != nil {
 		cacheCb(hh)
@@ -621,6 +627,7 @@ func (hm *HandshakeManager) DeleteHostInfo(hostinfo *HostInfo) {
 func (hm *HandshakeManager) unlockedDeleteHostInfo(hostinfo *HostInfo) {
 	for _, addr := range hostinfo.vpnAddrs {
 		if cur, ok := hm.vpnIps[addr]; ok && cur.hostinfo == hostinfo {
+			cur.deleted.Store(true)
 			delete(hm.vpnIps, addr)
 		}
 	}
