@@ -322,6 +322,7 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		reQueryWait:           c.GetDuration("timers.requery_wait_duration", defaultReQueryWait),
 		DropLocalBroadcast:    c.GetBool("tun.drop_local_broadcast", false),
 		DropMulticast:         c.GetBool("tun.drop_multicast", false),
+		BroadcastAddrs:        parseBroadcastAddrs(c, l),
 		routines:              routines,
 		MessageMetrics:        messageMetrics,
 		version:               buildVersion,
@@ -351,7 +352,7 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 				"routines", "tun.routines", "listen.routines", "firewall.conntrack.routine_cache_timeout",
 				"listen.port", "listen.host", "stats.message_metrics",
 				"handshakes.try_interval", "handshakes.retries", "handshakes.trigger_buffer",
-				"tun.drop_local_broadcast", "tun.drop_multicast",
+				"tun.drop_local_broadcast", "tun.drop_multicast", "tun.broadcast_addrs",
 			)
 			r.RestartRequiredIfChanged(osStartupOnlyKeys...)
 		})
@@ -461,6 +462,34 @@ func parseCpuAffinity(c *config.C, l *slog.Logger, routines int) []int {
 			"affinityLen", len(cpus), "routines", routines)
 	}
 	return cpus
+}
+
+// parseBroadcastAddrs reads `tun.broadcast_addrs` from the config — a list of
+// overlay addresses to forward broadcast and multicast inside packets to.
+// Entries that are not valid IP addresses are ignored with a warning. An unset
+// or empty list returns nil, meaning broadcast and multicast traffic is
+// dropped (the behavior before this option existed).
+func parseBroadcastAddrs(c *config.C, l *slog.Logger) []netip.Addr {
+	raw := c.Get("tun.broadcast_addrs")
+	if raw == nil {
+		return nil
+	}
+	rv, ok := raw.([]any)
+	if !ok {
+		l.Warn("tun.broadcast_addrs must be a list of IP addresses; ignoring", "value", raw)
+		return nil
+	}
+	addrs := make([]netip.Addr, 0, len(rv))
+	for i, e := range rv {
+		addr, err := netip.ParseAddr(fmt.Sprintf("%v", e))
+		if err != nil {
+			l.Warn("tun.broadcast_addrs entry not an IP address; ignoring",
+				"index", i, "value", e, "error", err)
+			continue
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs
 }
 
 func moduleVersion() string {

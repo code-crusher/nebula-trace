@@ -320,6 +320,15 @@ tun:
   drop_local_broadcast: false
   # Toggles forwarding of multicast packets. Not reloadable.
   drop_multicast: false
+  # broadcast_addrs, when set, forwards local broadcast and multicast packets to
+  # each listed overlay address (they must have a fully formed tunnel). This is
+  # how to carry game lobby discovery, mDNS, and similar local broadcast
+  # protocols over the mesh: each peer receives its own copy rewritten to its own
+  # overlay address. When unset, local broadcast and multicast packets are
+  # dropped unless drop_local_broadcast/drop_multicast say otherwise. Not reloadable.
+  #broadcast_addrs:
+  #  - 10.0.0.5
+  #  - 10.0.0.6
   # Sets the transmit queue length, if you notice lots of transmit drops on the tun it may help to raise this number. Default is 5000
   # Not reloadable.
   tx_queue: 5000

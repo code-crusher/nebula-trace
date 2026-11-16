@@ -79,6 +79,16 @@ func (f *Interface) consumeInsidePacket(pkt tio.Packet, fwPacket *firewall.Parse
 		return
 	}
 
+	// Broadcast and multicast traffic to the configured broadcast_addrs
+	// (or every connected peer when the list is empty). Each peer gets its own
+	// copy, rewritten to its own overlay address so its inbound firewall
+	// accepts it.
+	if f.isBroadcastAddress(fwPacket.RemoteAddr) {
+		if f.forwardBroadcast(pkt, nb, sendBatch) {
+			return
+		}
+	}
+
 	hostinfo, ready := f.getOrHandshakeConsiderRouting(&fwPacket.Packet, func(hh *HandshakeHostInfo) {
 		// borrowed: SegmentSuperpacket builds each segment in the kernel-supplied pkt
 		// bytes underneath. cachePacket explicitly copies its argument (handshake_manager.go cachePacket),
@@ -122,6 +132,64 @@ func (f *Interface) consumeInsidePacket(pkt tio.Packet, fwPacket *firewall.Parse
 			)
 		}
 	}
+}
+
+// isBroadcastAddress reports whether addr is a broadcast or multicast address
+// that consumeInsidePacket should flood to every peer in broadcastAddrs.
+// The local subnet broadcast is derived from the certificates' networks, the
+// same way myBroadcastAddrsTable is built.
+func (f *Interface) isBroadcastAddress(addr netip.Addr) bool {
+	if addr.IsMulticast() {
+		return true
+	}
+	if addr.Is4() {
+		// Compare against the local subnet broadcast addresses computed from
+		// our certificate networks. f.myBroadcastAddrsTable holds the same
+		// addresses, so reuse it rather than recomputing.
+		return f.myBroadcastAddrsTable.Contains(addr)
+	}
+	return false
+}
+
+// forwardBroadcast floods pkt to every configured broadcast_addrs overlay
+// address. It returns true if the packet was consumed by flooding, false if it
+// should be treated as ordinary unicast traffic (broadcast_addrs unset).
+//
+// Each destination gets its own copy with the destination address rewritten to
+// the peer's overlay address and every dependent checksum recomputed, so the
+// peer's inbound firewall (which only accepts its own addresses) passes it.
+// The copies are handed to sendInsideMessage, so a peer reached only through a
+// relay still receives its copy, and every copy is encrypted into the caller's
+// send batch.
+func (f *Interface) forwardBroadcast(pkt tio.Packet, nb []byte, sendBatch *batch.SendBatch) bool {
+	if len(f.broadcastAddrs) == 0 {
+		return false
+	}
+
+	// Segment once and reuse each segment's bytes across every destination. A
+	// non-GSO packet (the common case) calls fn exactly once.
+	err := tio.SegmentSuperpacket(pkt, func(seg []byte) error {
+		for _, addr := range f.broadcastAddrs {
+			hostinfo, ready := f.handshakeManager.GetOrHandshake(addr, nil)
+			if hostinfo == nil || !ready {
+				// No tunnel yet. GetOrHandshake started one; a repeating
+				// broadcast will be delivered once it completes.
+				continue
+			}
+			// The peer's copy must not mutate seg, which the next destination
+			// still needs, so detach it before rewriting.
+			copy := append([]byte(nil), seg...)
+			if !iputil.SetDestination(copy, addr) {
+				continue
+			}
+			f.sendInsideMessage(hostinfo, tio.Packet{Bytes: copy}, nb, sendBatch)
+		}
+		return nil
+	})
+	if err != nil {
+		f.l.Error("Failed to segment superpacket for broadcast", "error", err)
+	}
+	return true
 }
 
 func (f *Interface) sendInsideEncrypt(hostinfo *HostInfo, ci *ConnectionState, seg, scratch, nb []byte) []byte {

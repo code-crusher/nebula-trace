@@ -43,11 +43,16 @@ type InterfaceConfig struct {
 	connectionManager  *connectionManager
 	DropLocalBroadcast bool
 	DropMulticast      bool
-	routines           int
-	MessageMetrics     *MessageMetrics
-	version            string
-	relayManager       *relayManager
-	punchy             *Punchy
+	// BroadcastAddrs, when non-empty, names the overlay addresses to forward
+	// broadcast and multicast inside packets to. Each listed address must be
+	// a fully formed tunnel. When empty, broadcast and multicast traffic is
+	// dropped (the pre-existing behavior); see tun.broadcast_addrs.
+	BroadcastAddrs []netip.Addr
+	routines       int
+	MessageMetrics *MessageMetrics
+	version        string
+	relayManager   *relayManager
+	punchy         *Punchy
 
 	tryPromoteEvery uint32
 	reQueryEvery    uint32
@@ -87,6 +92,7 @@ type Interface struct {
 	myVpnNetworksTable    *bart.Lite
 	dropLocalBroadcast    bool
 	dropMulticast         bool
+	broadcastAddrs        []netip.Addr
 	routines              int
 	disconnectInvalid     atomic.Bool
 	closed                atomic.Bool
@@ -236,6 +242,7 @@ func NewInterface(ctx context.Context, c *InterfaceConfig) (*Interface, error) {
 		lightHouse:            c.lightHouse,
 		dropLocalBroadcast:    c.DropLocalBroadcast,
 		dropMulticast:         c.DropMulticast,
+		broadcastAddrs:        c.BroadcastAddrs,
 		routines:              c.routines,
 		version:               c.version,
 		writers:               make([]udp.Conn, c.routines),
